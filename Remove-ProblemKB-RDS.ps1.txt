@@ -659,7 +659,7 @@ function Install-RebootTask {
 function Invoke-GuardRefresh {
 
     $GuardUrl =
-        'http://provisioning.webstate.nl/snom/_D7/WindowsUpdateKBGuard.ps1.txt'
+        'https://github.com/Dekoning1224/WebstateScripts/raw/refs/heads/main/WindowsUpdateKBGuard.ps1.txt'
 
     $GuardFile =
         Join-Path $RootDir 'WindowsUpdateKBGuard.ps1'
