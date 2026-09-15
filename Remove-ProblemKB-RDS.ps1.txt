@@ -4,7 +4,7 @@
 <#
 =======================================================================
  Webstate - Problem KB Rollback
- Version: 4.0.2-MUTEX-DISM-RDSHFALLBACK
+ Version: 4.0.3-MUTEX-DISM-RDSHFALLBACK-ASYNCGUARD
 
  Doel:
  - Alleen echte RDS Session Hosts
@@ -32,7 +32,7 @@ $ProgressPreference    = 'SilentlyContinue'
 # CONFIGURATIE
 # =====================================================================
 
-$ScriptVersion = '4.0.2-MUTEX-DISM-RDSHFALLBACK'
+$ScriptVersion = '4.0.3-MUTEX-DISM-RDSHFALLBACK-ASYNCGUARD'
 
 $RootDir = 'C:\ProgramData\Webstate'
 $BaseDir = Join-Path $RootDir 'WindowsUpdateGuard'
@@ -742,7 +742,17 @@ function Install-RebootTask {
 
 
 # =====================================================================
-# GUARD REFRESH
+# GUARD REFRESH - DETACHED
+#
+# BELANGRIJK:
+# De Guard wordt NIET meer synchroon vanuit de rollback uitgevoerd.
+# Een trage/hangende Guard mag de rollback-mutex nooit vasthouden.
+#
+# Flow:
+#   1. Schrijf lokale helper.
+#   2. Start helper detached in een apart PowerShell-proces.
+#   3. Keer direct terug naar de rollback.
+#   4. Rollback kan afsluiten en de named mutex vrijgeven.
 # =====================================================================
 
 function Invoke-GuardRefresh {
@@ -753,19 +763,170 @@ function Invoke-GuardRefresh {
     $GuardFile =
         Join-Path $RootDir 'WindowsUpdateGuard.ps1'
 
+    $GuardRefreshHelper =
+        Join-Path $BaseDir 'Invoke-KBGuardRefresh.ps1'
+
+    $GuardRefreshLog =
+        Join-Path $BaseDir 'guard-refresh.log'
+
     try {
 
-        Invoke-RestMethod `
-            -Uri $GuardUrl `
-            -OutFile $GuardFile `
+        $HelperContent = @"
+`$ErrorActionPreference = 'Stop'
+`$ProgressPreference    = 'SilentlyContinue'
+
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+`$GuardUrl  = '$GuardUrl'
+`$GuardFile = '$GuardFile'
+`$LogFile   = '$GuardRefreshLog'
+`$TempFile  = "`$GuardFile.`$PID.download"
+
+function Write-RefreshLog {
+    param([string]`$Message)
+
+    try {
+        Add-Content `
+            -Path `$LogFile `
+            -Value ("{0} - {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), `$Message) `
+            -Encoding UTF8
+    }
+    catch {
+    }
+}
+
+try {
+
+    Write-RefreshLog 'Guard refresh helper gestart.'
+
+    Remove-Item `
+        -Path `$TempFile `
+        -Force `
+        -ErrorAction SilentlyContinue
+
+    Invoke-RestMethod `
+        -Uri `$GuardUrl `
+        -OutFile `$TempFile `
+        -TimeoutSec 30 `
+        -ErrorAction Stop
+
+    if (
+        -not (Test-Path `$TempFile) -or
+        (Get-Item `$TempFile).Length -le 0
+    ) {
+        throw 'Gedownloade Guard is leeg of ontbreekt.'
+    }
+
+    Move-Item `
+        -Path `$TempFile `
+        -Destination `$GuardFile `
+        -Force `
+        -ErrorAction Stop
+
+    Write-RefreshLog (
+        'Guard gedownload: {0} bytes.' -f
+        (Get-Item `$GuardFile).Length
+    )
+
+    `$GuardStdOut = Join-Path (Split-Path `$LogFile -Parent) 'guard-refresh-guard.stdout.log'
+    `$GuardStdErr = Join-Path (Split-Path `$LogFile -Parent) 'guard-refresh-guard.stderr.log'
+
+    `$GuardProcess = Start-Process `
+        -FilePath 'powershell.exe' `
+        -ArgumentList @(
+            '-NoProfile',
+            '-NonInteractive',
+            '-ExecutionPolicy',
+            'Bypass',
+            '-File',
+            `$GuardFile,
+            '-Mode',
+            'Guard'
+        ) `
+        -WindowStyle Hidden `
+        -RedirectStandardOutput `$GuardStdOut `
+        -RedirectStandardError `$GuardStdErr `
+        -PassThru `
+        -ErrorAction Stop
+
+    if (-not `$GuardProcess.WaitForExit(600000)) {
+
+        Stop-Process `
+            -Id `$GuardProcess.Id `
+            -Force `
+            -ErrorAction SilentlyContinue
+
+        throw 'Guard timeout na 600 seconden.'
+    }
+
+    `$GuardProcess.Refresh()
+    `$GuardExitCode = `$GuardProcess.ExitCode
+
+    Write-RefreshLog (
+        'Guard afgerond. ExitCode={0}' -f
+        `$GuardExitCode
+    )
+
+    exit `$GuardExitCode
+}
+catch {
+
+    Write-RefreshLog (
+        'FOUT: ' + `$_.Exception.Message
+    )
+
+    exit 50
+}
+finally {
+
+    Remove-Item `
+        -Path `$TempFile `
+        -Force `
+        -ErrorAction SilentlyContinue
+}
+"@
+
+        Set-Content `
+            -Path $GuardRefreshHelper `
+            -Value $HelperContent `
+            -Encoding UTF8 `
             -ErrorAction Stop
 
-        & $GuardFile -Mode Guard
+        $Stamp = Get-Date -Format 'yyyyMMdd-HHmmss-fff'
+
+        $StdOutLog =
+            Join-Path $BaseDir ("guard-refresh-$Stamp.stdout.log")
+
+        $StdErrLog =
+            Join-Path $BaseDir ("guard-refresh-$Stamp.stderr.log")
+
+        $Process = Start-Process `
+            -FilePath 'powershell.exe' `
+            -ArgumentList @(
+                '-NoProfile',
+                '-NonInteractive',
+                '-ExecutionPolicy',
+                'Bypass',
+                '-File',
+                $GuardRefreshHelper
+            ) `
+            -WindowStyle Hidden `
+            -RedirectStandardOutput $StdOutLog `
+            -RedirectStandardError $StdErrLog `
+            -PassThru `
+            -ErrorAction Stop
+
+        Write-Log (
+            (
+                'Guard refresh detached gestart. PID={0}. ' +
+                'Rollback wacht hier niet op.'
+            ) -f $Process.Id
+        )
     }
     catch {
 
         Write-Log (
-            'WAARSCHUWING: Guard refresh mislukt: ' +
+            'WAARSCHUWING: Guard refresh kon niet detached worden gestart: ' +
             $_.Exception.Message
         )
     }
@@ -968,9 +1129,10 @@ try {
     ) {
 
         Write-Log (
-            '{0} is niet meer geïnstalleerd en er is geen actief ' +
-            'CBS RollupFix-package gevonden.' -f
-            $TargetKB
+            (
+                '{0} is niet meer geinstalleerd en er is geen actief ' +
+                'CBS RollupFix-package gevonden.'
+            ) -f $TargetKB
         )
 
         Set-RollbackState `
