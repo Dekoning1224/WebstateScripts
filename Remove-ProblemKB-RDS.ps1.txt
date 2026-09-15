@@ -51,7 +51,7 @@ $PostBootTaskName = 'Webstate - KB Guard after rollback'
 
 $RebootHelperScript = Join-Path $BaseDir 'Invoke-KBRollbackReboot.ps1'
 
-$ForceRebootUrl = 'http://provisioning.webstate.nl/snom/_D7/Force-KBRollback-RebootNow.ps1.txt'
+$ForceRebootUrl = 'https://raw.githubusercontent.com/Dekoning1224/WebstateScripts/refs/heads/main/Force-KBRollback-RebootNow.ps1.txt'
 
 # Global = mutex geldt over RDP/SYSTEM/Zabbix-sessies heen.
 $MutexName = 'Global\Webstate_Remove_ProblemKB_RDS'
