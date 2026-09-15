@@ -4,7 +4,7 @@
 <#
 =======================================================================
  Webstate - Problem KB Rollback
- Version: 4.0.3-MUTEX-DISM-RDSHFALLBACK-ASYNCGUARD
+ Version: 4.0.4-MUTEX-DISM-RDSHFALLBACK-ASYNCGUARD
 
  Doel:
  - Alleen echte RDS Session Hosts
@@ -32,7 +32,7 @@ $ProgressPreference    = 'SilentlyContinue'
 # CONFIGURATIE
 # =====================================================================
 
-$ScriptVersion = '4.0.3-MUTEX-DISM-RDSHFALLBACK-ASYNCGUARD'
+$ScriptVersion = '4.0.4-MUTEX-DISM-RDSHFALLBACK-ASYNCGUARD'
 
 $RootDir = 'C:\ProgramData\Webstate'
 $BaseDir = Join-Path $RootDir 'WindowsUpdateGuard'
@@ -771,25 +771,26 @@ function Invoke-GuardRefresh {
 
     try {
 
-        $HelperContent = @"
-`$ErrorActionPreference = 'Stop'
-`$ProgressPreference    = 'SilentlyContinue'
+        # Single-quoted here-string is bewust.
+        # Hierdoor worden $, backticks en regeleinden NIET door het
+        # rollback-script geinterpreteerd terwijl de helper wordt opgebouwd.
+        # Dit voorkomt o.a. een gegenereerde "Remove-Item" zonder -Path.
+        $HelperContent = @'
+$ErrorActionPreference = 'Stop'
+$ProgressPreference    = 'SilentlyContinue'
 
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-`$GuardUrl  = '$GuardUrl'
-`$GuardFile = '$GuardFile'
-`$LogFile   = '$GuardRefreshLog'
-`$TempFile  = "`$GuardFile.`$PID.download"
+$GuardUrl  = '__GUARD_URL__'
+$GuardFile = '__GUARD_FILE__'
+$LogFile   = '__LOG_FILE__'
+$TempFile  = $GuardFile + '.' + $PID + '.download'
 
 function Write-RefreshLog {
-    param([string]`$Message)
+    param([string]$Message)
 
     try {
-        Add-Content `
-            -Path `$LogFile `
-            -Value ("{0} - {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), `$Message) `
-            -Encoding UTF8
+        Add-Content -LiteralPath $LogFile -Value ("{0} - {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Message) -Encoding UTF8
     }
     catch {
     }
@@ -799,92 +800,97 @@ try {
 
     Write-RefreshLog 'Guard refresh helper gestart.'
 
-    Remove-Item `
-        -Path `$TempFile `
-        -Force `
-        -ErrorAction SilentlyContinue
+    if (Test-Path -LiteralPath $TempFile) {
+        Remove-Item -LiteralPath $TempFile -Force -ErrorAction SilentlyContinue
+    }
 
-    Invoke-RestMethod `
-        -Uri `$GuardUrl `
-        -OutFile `$TempFile `
-        -TimeoutSec 30 `
-        -ErrorAction Stop
+    Invoke-RestMethod -Uri $GuardUrl -OutFile $TempFile -TimeoutSec 30 -ErrorAction Stop
 
     if (
-        -not (Test-Path `$TempFile) -or
-        (Get-Item `$TempFile).Length -le 0
+        -not (Test-Path -LiteralPath $TempFile) -or
+        (Get-Item -LiteralPath $TempFile).Length -le 0
     ) {
         throw 'Gedownloade Guard is leeg of ontbreekt.'
     }
 
-    Move-Item `
-        -Path `$TempFile `
-        -Destination `$GuardFile `
-        -Force `
-        -ErrorAction Stop
+    Move-Item -LiteralPath $TempFile -Destination $GuardFile -Force -ErrorAction Stop
 
     Write-RefreshLog (
         'Guard gedownload: {0} bytes.' -f
-        (Get-Item `$GuardFile).Length
+        (Get-Item -LiteralPath $GuardFile).Length
     )
 
-    `$GuardStdOut = Join-Path (Split-Path `$LogFile -Parent) 'guard-refresh-guard.stdout.log'
-    `$GuardStdErr = Join-Path (Split-Path `$LogFile -Parent) 'guard-refresh-guard.stderr.log'
+    $LogDir = Split-Path -Path $LogFile -Parent
+    $Stamp  = Get-Date -Format 'yyyyMMdd-HHmmss-fff'
 
-    `$GuardProcess = Start-Process `
-        -FilePath 'powershell.exe' `
-        -ArgumentList @(
-            '-NoProfile',
-            '-NonInteractive',
-            '-ExecutionPolicy',
-            'Bypass',
-            '-File',
-            `$GuardFile,
-            '-Mode',
-            'Guard'
-        ) `
-        -WindowStyle Hidden `
-        -RedirectStandardOutput `$GuardStdOut `
-        -RedirectStandardError `$GuardStdErr `
-        -PassThru `
-        -ErrorAction Stop
+    $GuardStdOut = Join-Path $LogDir ("guard-run-$Stamp.stdout.log")
+    $GuardStdErr = Join-Path $LogDir ("guard-run-$Stamp.stderr.log")
 
-    if (-not `$GuardProcess.WaitForExit(600000)) {
+    $GuardArguments = @(
+        '-NoProfile'
+        '-NonInteractive'
+        '-ExecutionPolicy'
+        'Bypass'
+        '-File'
+        $GuardFile
+        '-Mode'
+        'Guard'
+    )
 
-        Stop-Process `
-            -Id `$GuardProcess.Id `
-            -Force `
-            -ErrorAction SilentlyContinue
+    $GuardProcess = Start-Process -FilePath 'powershell.exe' -ArgumentList $GuardArguments -WindowStyle Hidden -RedirectStandardOutput $GuardStdOut -RedirectStandardError $GuardStdErr -PassThru -ErrorAction Stop
+
+    Write-RefreshLog (
+        'Guard gestart. PID={0}.' -f
+        $GuardProcess.Id
+    )
+
+    if (-not $GuardProcess.WaitForExit(600000)) {
+
+        Stop-Process -Id $GuardProcess.Id -Force -ErrorAction SilentlyContinue
 
         throw 'Guard timeout na 600 seconden.'
     }
 
-    `$GuardProcess.Refresh()
-    `$GuardExitCode = `$GuardProcess.ExitCode
+    $GuardProcess.Refresh()
+    $GuardExitCode = $GuardProcess.ExitCode
 
     Write-RefreshLog (
-        'Guard afgerond. ExitCode={0}' -f
-        `$GuardExitCode
+        'Guard afgerond. ExitCode={0}.' -f
+        $GuardExitCode
     )
 
-    exit `$GuardExitCode
+    exit $GuardExitCode
 }
 catch {
 
     Write-RefreshLog (
-        'FOUT: ' + `$_.Exception.Message
+        'FOUT: ' + $_.Exception.Message
     )
 
     exit 50
 }
 finally {
 
-    Remove-Item `
-        -Path `$TempFile `
-        -Force `
-        -ErrorAction SilentlyContinue
+    if ($TempFile -and (Test-Path -LiteralPath $TempFile)) {
+        Remove-Item -LiteralPath $TempFile -Force -ErrorAction SilentlyContinue
+    }
 }
-"@
+'@
+
+        $HelperContent = $HelperContent.Replace(
+            '__GUARD_URL__',
+            $GuardUrl.Replace("'", "''")
+        )
+
+        $HelperContent = $HelperContent.Replace(
+            '__GUARD_FILE__',
+            $GuardFile.Replace("'", "''")
+        )
+
+        $HelperContent = $HelperContent.Replace(
+            '__LOG_FILE__',
+            $GuardRefreshLog.Replace("'", "''")
+        )
 
         Set-Content `
             -Path $GuardRefreshHelper `
@@ -900,16 +906,18 @@ finally {
         $StdErrLog =
             Join-Path $BaseDir ("guard-refresh-$Stamp.stderr.log")
 
+        $ProcessArguments = @(
+            '-NoProfile'
+            '-NonInteractive'
+            '-ExecutionPolicy'
+            'Bypass'
+            '-File'
+            $GuardRefreshHelper
+        )
+
         $Process = Start-Process `
             -FilePath 'powershell.exe' `
-            -ArgumentList @(
-                '-NoProfile',
-                '-NonInteractive',
-                '-ExecutionPolicy',
-                'Bypass',
-                '-File',
-                $GuardRefreshHelper
-            ) `
+            -ArgumentList $ProcessArguments `
             -WindowStyle Hidden `
             -RedirectStandardOutput $StdOutLog `
             -RedirectStandardError $StdErrLog `
@@ -931,7 +939,6 @@ finally {
         )
     }
 }
-
 
 # =====================================================================
 # NAMED MUTEX
