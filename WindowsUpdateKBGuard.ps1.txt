@@ -19,7 +19,7 @@ $InstallFile = Join-Path $StateDir 'installed.txt'
 $MessageFile = Join-Path $StateDir 'message.txt'
 $LastRunFile = Join-Path $StateDir 'last-run.txt'
 
-$ModuleUrl = 'http://provisioning.webstate.nl/snom/_D7/PSWindowsUpdate.zip'
+$ModuleUrl = 'https://github.com/Dekoning1224/WebstateScripts/raw/refs/heads/main/PSWindowsUpdate.zip'
 
 New-Item -ItemType Directory -Path $BaseDir -Force | Out-Null
 New-Item -ItemType Directory -Path $StateDir -Force | Out-Null
