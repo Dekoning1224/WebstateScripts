@@ -29,7 +29,7 @@ $PostBootScript = Join-Path $BaseDir 'PostBoot-KBGuard.ps1'
 $RebootTaskName   = 'Webstate - Reboot after Windows Update rollback'
 $PostBootTaskName = 'Webstate - KB Guard after rollback'
 
-$GuardUrl  = 'http://provisioning.webstate.nl/snom/_D7/WindowsUpdateKBGuard.ps1.txt'
+$GuardUrl  = 'https://github.com/Dekoning1224/WebstateScripts/raw/refs/heads/main/WindowsUpdateKBGuard.ps1.txt'
 $GuardFile = 'C:\ProgramData\Webstate\WindowsUpdateGuard.ps1'
 
 $MinimumDisconnectedMinutes = 60
