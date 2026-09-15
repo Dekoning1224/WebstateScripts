@@ -4,7 +4,7 @@
 <#
 =======================================================================
  Webstate - Problem KB Rollback
- Version: 4.0.1-MUTEX-DISM
+ Version: 4.0.2-MUTEX-DISM-RDSHFALLBACK
 
  Doel:
  - Alleen echte RDS Session Hosts
@@ -24,12 +24,15 @@ param()
 $ErrorActionPreference = 'Stop'
 $ProgressPreference    = 'SilentlyContinue'
 
+# GitHub Raw vereist TLS 1.2 op oudere Windows PowerShell/.NET-combinaties.
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
 
 # =====================================================================
 # CONFIGURATIE
 # =====================================================================
 
-$ScriptVersion = '4.0.1-MUTEX-DISM'
+$ScriptVersion = '4.0.2-MUTEX-DISM-RDSHFALLBACK'
 
 $RootDir = 'C:\ProgramData\Webstate'
 $BaseDir = Join-Path $RootDir 'WindowsUpdateGuard'
@@ -51,7 +54,7 @@ $PostBootTaskName = 'Webstate - KB Guard after rollback'
 
 $RebootHelperScript = Join-Path $BaseDir 'Invoke-KBRollbackReboot.ps1'
 
-$ForceRebootUrl = 'https://raw.githubusercontent.com/Dekoning1224/WebstateScripts/refs/heads/main/Force-KBRollback-RebootNow.ps1.txt'
+$ForceRebootUrl = 'https://raw.githubusercontent.com/Dekoning1224/WebstateScripts/main/Force-KBRollback-RebootNow.ps1.txt'
 
 # Global = mutex geldt over RDP/SYSTEM/Zabbix-sessies heen.
 $MutexName = 'Global\Webstate_Remove_ProblemKB_RDS'
@@ -183,6 +186,9 @@ function Remove-LegacyLockFile {
 
 function Test-IsRDSSessionHost {
 
+    # TermService moet op een Windows Server met RDS-functionaliteit bestaan.
+    # Alleen de aanwezigheid/status van TermService is echter NIET voldoende
+    # om een echte RD Session Host te bevestigen.
     try {
 
         $TermService = Get-Service `
@@ -196,6 +202,13 @@ function Test-IsRDSSessionHost {
         return $false
     }
 
+    $IsRDSH = $false
+    $DetectionMethod = $null
+    $PrimaryCheckFailed = $false
+
+    # -----------------------------------------------------------------
+    # PRIMAIR: ServerManager / Get-WindowsFeature
+    # -----------------------------------------------------------------
     try {
 
         Import-Module ServerManager `
@@ -204,27 +217,101 @@ function Test-IsRDSSessionHost {
         $RdsFeature = Get-WindowsFeature `
             -Name 'RDS-RD-Server' `
             -ErrorAction Stop
+
+        if ($RdsFeature -and $RdsFeature.Installed) {
+
+            $IsRDSH = $true
+            $DetectionMethod = 'Get-WindowsFeature'
+        }
+        else {
+
+            # Als Get-WindowsFeature betrouwbaar antwoord geeft dat de rol
+            # niet Installed is, gebruiken we GEEN fallback om dat antwoord
+            # te overrulen.
+            Write-Log 'SKIP: RDS-RD-Server is gecontroleerd en niet Installed.'
+
+            return $false
+        }
     }
     catch {
 
+        $PrimaryCheckFailed = $true
+
         Write-Log (
-            'STOP: RDS-RD-Server feature kon niet worden gecontroleerd: ' +
+            'WAARSCHUWING: Get-WindowsFeature RDS-RD-Server kon niet ' +
+            'worden uitgevoerd: ' +
             $_.Exception.Message
         )
 
-        return $false
+        Write-Log (
+            'Fallback naar Win32_ServerFeature ID 130 wordt uitgevoerd.'
+        )
     }
 
-    if (-not $RdsFeature.Installed) {
+    # -----------------------------------------------------------------
+    # FALLBACK: Win32_ServerFeature ID 130 = RD Session Host
+    #
+    # Deze fallback wordt ALLEEN gebruikt wanneer Get-WindowsFeature zelf
+    # faalt (bijvoorbeeld 0x800f080c). Als ook deze controle faalt of ID 130
+    # ontbreekt, stoppen we fail-closed.
+    # -----------------------------------------------------------------
+    if (-not $IsRDSH -and $PrimaryCheckFailed) {
 
-        Write-Log 'SKIP: RDS-RD-Server is niet Installed.'
+        try {
+
+            $RdsFeatureFallback = Get-CimInstance `
+                -ClassName Win32_ServerFeature `
+                -Filter 'ID = 130' `
+                -ErrorAction Stop |
+            Select-Object -First 1
+
+            if ($RdsFeatureFallback) {
+
+                $IsRDSH = $true
+                $DetectionMethod = 'Win32_ServerFeature-ID130'
+
+                Write-Log (
+                    'RDS Session Host bevestigd via fallback ' +
+                    'Win32_ServerFeature ID 130. ' +
+                    "Name='$($RdsFeatureFallback.Name)'."
+                )
+            }
+            else {
+
+                Write-Log (
+                    'STOP: Get-WindowsFeature faalde en ' +
+                    'Win32_ServerFeature ID 130 is niet aanwezig. ' +
+                    'RDS Session Host kon niet betrouwbaar worden bevestigd.'
+                )
+
+                return $false
+            }
+        }
+        catch {
+
+            Write-Log (
+                'STOP: Get-WindowsFeature faalde en ook de fallback ' +
+                'Win32_ServerFeature kon niet worden gecontroleerd: ' +
+                $_.Exception.Message
+            )
+
+            return $false
+        }
+    }
+
+    if (-not $IsRDSH) {
+
+        Write-Log (
+            'STOP: server kon niet betrouwbaar als RDS Session Host ' +
+            'worden bevestigd.'
+        )
 
         return $false
     }
 
     Write-Log 'RDS Session Host bevestigd.'
     Write-Log "TermService = $($TermService.Status)"
-    Write-Log 'RDS-RD-Server = Installed'
+    Write-Log "RDS detectiemethode = $DetectionMethod"
 
     return $true
 }
@@ -519,6 +606,8 @@ function Install-RebootHelper {
 `$ErrorActionPreference = 'Stop'
 `$ProgressPreference    = 'SilentlyContinue'
 
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
 `$Now = Get-Date
 
 # Alleen nachtvenster.
@@ -659,10 +748,10 @@ function Install-RebootTask {
 function Invoke-GuardRefresh {
 
     $GuardUrl =
-        'https://github.com/Dekoning1224/WebstateScripts/raw/refs/heads/main/WindowsUpdateKBGuard.ps1.txt'
+        'https://raw.githubusercontent.com/Dekoning1224/WebstateScripts/main/WindowsUpdateKBGuard.ps1.txt'
 
     $GuardFile =
-        Join-Path $RootDir 'WindowsUpdateKBGuard.ps1'
+        Join-Path $RootDir 'WindowsUpdateGuard.ps1'
 
     try {
 
