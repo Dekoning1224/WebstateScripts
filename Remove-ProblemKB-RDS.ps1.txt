@@ -1,0 +1,1216 @@
+#Requires -Version 5.1
+#Requires -RunAsAdministrator
+
+<#
+=======================================================================
+ Webstate - Problem KB Rollback
+ Version: 4.0.1-MUTEX-DISM
+
+ Doel:
+ - Alleen echte RDS Session Hosts
+ - Exacte problematische KB per Windows Server-versie
+ - Native CBS/DISM uninstall via Remove-WindowsPackage
+ - GEEN PSWindowsUpdate voor uninstall
+ - Named Mutex tegen parallelle rollbacks
+ - Geen rollback.lock meer als lockingmechanisme
+ - Reboot pas nadat CBS uninstall heeft geaccepteerd
+ - Veilige reboot via aparte Force-KBRollback-RebootNow.ps1
+=======================================================================
+#>
+
+[CmdletBinding()]
+param()
+
+$ErrorActionPreference = 'Stop'
+$ProgressPreference    = 'SilentlyContinue'
+
+
+# =====================================================================
+# CONFIGURATIE
+# =====================================================================
+
+$ScriptVersion = '4.0.1-MUTEX-DISM'
+
+$RootDir = 'C:\ProgramData\Webstate'
+$BaseDir = Join-Path $RootDir 'WindowsUpdateGuard'
+
+$LogFile             = Join-Path $BaseDir 'rollback.log'
+$RollbackStateFile   = Join-Path $BaseDir 'rollback-state.txt'
+$RollbackKBFile      = Join-Path $BaseDir 'rollback-kb.txt'
+$RollbackPackageFile = Join-Path $BaseDir 'rollback-package.txt'
+$RollbackRebootFile  = Join-Path $BaseDir 'rollback-reboot.txt'
+$RollbackVersionFile = Join-Path $BaseDir 'rollback-version.txt'
+$RollbackMessageFile = Join-Path $BaseDir 'rollback-message.txt'
+
+# Oude file-lock.
+# Deze wordt vanaf deze versie NIET meer gebruikt voor locking.
+$LegacyLockFile = Join-Path $BaseDir 'rollback.lock'
+
+$RebootTaskName   = 'Webstate - Reboot after Windows Update rollback'
+$PostBootTaskName = 'Webstate - KB Guard after rollback'
+
+$RebootHelperScript = Join-Path $BaseDir 'Invoke-KBRollbackReboot.ps1'
+
+$ForceRebootUrl = 'http://provisioning.webstate.nl/snom/_D7/Force-KBRollback-RebootNow.ps1.txt'
+
+# Global = mutex geldt over RDP/SYSTEM/Zabbix-sessies heen.
+$MutexName = 'Global\Webstate_Remove_ProblemKB_RDS'
+
+
+# =====================================================================
+# DIRECTORY
+# =====================================================================
+
+New-Item `
+    -ItemType Directory `
+    -Path $BaseDir `
+    -Force |
+Out-Null
+
+
+# =====================================================================
+# LOGGING
+# =====================================================================
+
+function Write-Log {
+
+    param(
+        [Parameter(Mandatory)]
+        [string]$Message
+    )
+
+    $Line = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - $Message"
+
+    try {
+
+        Add-Content `
+            -Path $LogFile `
+            -Value $Line `
+            -Encoding UTF8
+    }
+    catch {
+    }
+
+    Write-Host $Line
+}
+
+
+function Set-RollbackState {
+
+    param(
+        [Parameter(Mandatory)]
+        [string]$State,
+
+        [string]$KB = '',
+
+        [string]$Package = '',
+
+        [string]$Message = ''
+    )
+
+    Set-Content `
+        -Path $RollbackStateFile `
+        -Value $State `
+        -Encoding ASCII
+
+    if ($KB) {
+
+        Set-Content `
+            -Path $RollbackKBFile `
+            -Value $KB `
+            -Encoding ASCII
+    }
+
+    if ($Package) {
+
+        Set-Content `
+            -Path $RollbackPackageFile `
+            -Value $Package `
+            -Encoding ASCII
+    }
+
+    Set-Content `
+        -Path $RollbackVersionFile `
+        -Value $ScriptVersion `
+        -Encoding ASCII
+
+    if ($Message) {
+
+        Set-Content `
+            -Path $RollbackMessageFile `
+            -Value $Message `
+            -Encoding UTF8
+    }
+}
+
+
+# =====================================================================
+# OUDE LOCKFILE
+#
+# Wordt niet meer gebruikt.
+# Indien verwijderen niet lukt omdat een oud proces hem nog open heeft,
+# maakt dat voor deze versie niets uit.
+# =====================================================================
+
+function Remove-LegacyLockFile {
+
+    if (-not (Test-Path $LegacyLockFile)) {
+        return
+    }
+
+    try {
+
+        Remove-Item `
+            -Path $LegacyLockFile `
+            -Force `
+            -ErrorAction Stop
+
+        Write-Log 'Legacy rollback.lock verwijderd.'
+    }
+    catch {
+
+        Write-Log (
+            'Legacy rollback.lock kon niet worden verwijderd, ' +
+            'maar wordt vanaf v4 volledig genegeerd.'
+        )
+    }
+}
+
+
+# =====================================================================
+# RDS SESSION HOST CONTROLEREN
+# =====================================================================
+
+function Test-IsRDSSessionHost {
+
+    try {
+
+        $TermService = Get-Service `
+            -Name 'TermService' `
+            -ErrorAction Stop
+    }
+    catch {
+
+        Write-Log 'STOP: TermService bestaat niet.'
+
+        return $false
+    }
+
+    try {
+
+        Import-Module ServerManager `
+            -ErrorAction Stop
+
+        $RdsFeature = Get-WindowsFeature `
+            -Name 'RDS-RD-Server' `
+            -ErrorAction Stop
+    }
+    catch {
+
+        Write-Log (
+            'STOP: RDS-RD-Server feature kon niet worden gecontroleerd: ' +
+            $_.Exception.Message
+        )
+
+        return $false
+    }
+
+    if (-not $RdsFeature.Installed) {
+
+        Write-Log 'SKIP: RDS-RD-Server is niet Installed.'
+
+        return $false
+    }
+
+    Write-Log 'RDS Session Host bevestigd.'
+    Write-Log "TermService = $($TermService.Status)"
+    Write-Log 'RDS-RD-Server = Installed'
+
+    return $true
+}
+
+
+# =====================================================================
+# TARGET KB
+#
+# ALLEEN DEZE EXACTE KB'S
+# =====================================================================
+
+function Get-TargetKB {
+
+    param(
+        [Parameter(Mandatory)]
+        [int]$Build
+    )
+
+    switch ($Build) {
+
+        26100 {
+            return 'KB5122871'
+        }
+
+        20348 {
+            return 'KB5122882'
+        }
+
+        17763 {
+            return 'KB5122890'
+        }
+
+        14393 {
+            return 'KB5123099'
+        }
+
+        default {
+            return $null
+        }
+    }
+}
+
+
+# =====================================================================
+# MUM CONTROLEREN OP KB
+# =====================================================================
+
+function Get-MumMatchType {
+
+    param(
+        [Parameter(Mandatory)]
+        [string]$PackageName,
+
+        [Parameter(Mandatory)]
+        [string]$KB
+    )
+
+    $MumPath = Join-Path `
+        "$env:windir\servicing\Packages" `
+        "$PackageName.mum"
+
+    if (-not (Test-Path $MumPath)) {
+
+        return 'None'
+    }
+
+    try {
+
+        $Raw = [System.IO.File]::ReadAllText(
+            $MumPath
+        )
+    }
+    catch {
+
+        return 'None'
+    }
+
+    $EscapedKB = [regex]::Escape($KB)
+
+    $ExactPattern = (
+        '(?i)(identifier|KBArticleID)\s*=\s*["'']' +
+        $EscapedKB +
+        '["'']'
+    )
+
+    if (
+        [regex]::IsMatch(
+            $Raw,
+            $ExactPattern
+        )
+    ) {
+
+        return 'Exact'
+    }
+
+    if (
+        $Raw.IndexOf(
+            $KB,
+            [System.StringComparison]::OrdinalIgnoreCase
+        ) -ge 0
+    ) {
+
+        return 'Mention'
+    }
+
+    return 'None'
+}
+
+
+# =====================================================================
+# EXACT ROLLUP PACKAGE ZOEKEN
+# =====================================================================
+
+function Find-ExactRollupPackage {
+
+    param(
+        [Parameter(Mandatory)]
+        [string]$KB
+    )
+
+    Write-Log (
+        'Zoeken naar CBS RollupFix-package voor {0}...' -f $KB
+    )
+
+    $Packages = @(
+        Get-WindowsPackage `
+            -Online `
+            -ErrorAction Stop |
+        Where-Object {
+
+            $_.PackageName -like 'Package_for_RollupFix*' -and
+            [string]$_.PackageState -in @(
+                'Installed',
+                'UninstallPending'
+            )
+        } |
+        Sort-Object InstallTime -Descending
+    )
+
+    if ($Packages.Count -eq 0) {
+
+        Write-Log (
+            'Geen Installed/UninstallPending RollupFix-packages gevonden.'
+        )
+
+        return $null
+    }
+
+    $ExactMatches   = @()
+    $MentionMatches = @()
+
+    foreach ($Package in $Packages) {
+
+        $MatchType = Get-MumMatchType `
+            -PackageName $Package.PackageName `
+            -KB $KB
+
+        switch ($MatchType) {
+
+            'Exact' {
+
+                $ExactMatches += $Package
+
+                Write-Log (
+                    'Exacte MUM match: {0} [{1}]' -f
+                    $Package.PackageName,
+                    $Package.PackageState
+                )
+            }
+
+            'Mention' {
+
+                $MentionMatches += $Package
+
+                # BELANGRIJKE FIX:
+                # Geen "$KB:" meer in een double quoted string.
+                Write-Log (
+                    'MUM vermeldt {0}: {1} [{2}]' -f
+                    $KB,
+                    $Package.PackageName,
+                    $Package.PackageState
+                )
+            }
+        }
+    }
+
+    if ($ExactMatches.Count -eq 1) {
+
+        return $ExactMatches[0]
+    }
+
+    if ($ExactMatches.Count -gt 1) {
+
+        Write-Log (
+            'STOP: meerdere exacte CBS-packages matchen {0}.' -f
+            $KB
+        )
+
+        foreach ($P in $ExactMatches) {
+
+            Write-Log (
+                'Ambigue package: {0} [{1}]' -f
+                $P.PackageName,
+                $P.PackageState
+            )
+        }
+
+        return $null
+    }
+
+    if ($MentionMatches.Count -eq 1) {
+
+        Write-Log (
+            'Geen identifier-match, maar exact één unieke ' +
+            'MUM-reference gevonden.'
+        )
+
+        return $MentionMatches[0]
+    }
+
+    if ($MentionMatches.Count -gt 1) {
+
+        Write-Log (
+            'STOP: meerdere CBS-packages vermelden {0}. ' +
+            'Automatische uninstall wordt geweigerd.' -f
+            $KB
+        )
+
+        foreach ($P in $MentionMatches) {
+
+            Write-Log (
+                'Ambigue package: {0} [{1}]' -f
+                $P.PackageName,
+                $P.PackageState
+            )
+        }
+    }
+
+    return $null
+}
+
+
+# =====================================================================
+# OUDE ROLLBACK TASKS VERWIJDEREN
+# =====================================================================
+
+function Remove-StaleRollbackTasks {
+
+    foreach (
+        $TaskName in @(
+            $RebootTaskName,
+            $PostBootTaskName
+        )
+    ) {
+
+        try {
+
+            Stop-ScheduledTask `
+                -TaskName $TaskName `
+                -ErrorAction SilentlyContinue
+        }
+        catch {
+        }
+
+        try {
+
+            Unregister-ScheduledTask `
+                -TaskName $TaskName `
+                -Confirm:$false `
+                -ErrorAction SilentlyContinue
+        }
+        catch {
+        }
+    }
+
+    Write-Log (
+        'Eventuele oude rollback/postboot tasks opgeruimd.'
+    )
+}
+
+
+# =====================================================================
+# REBOOT HELPER
+#
+# Downloadt bij iedere poging de nieuwste:
+# Force-KBRollback-RebootNow.ps1.txt
+# =====================================================================
+
+function Install-RebootHelper {
+
+    $Content = @"
+`$ErrorActionPreference = 'Stop'
+`$ProgressPreference    = 'SilentlyContinue'
+
+`$Now = Get-Date
+
+# Alleen nachtvenster.
+# Vanaf 05:00 niet meer automatisch rebooten.
+if (`$Now.Hour -ge 5 -and `$Now.Hour -lt 23) {
+    exit 0
+}
+
+`$Root = 'C:\ProgramData\Webstate'
+`$File = Join-Path `$Root 'Force-KBRollback-RebootNow.ps1'
+
+New-Item `
+    -ItemType Directory `
+    -Path `$Root `
+    -Force |
+Out-Null
+
+Invoke-RestMethod `
+    -Uri '$ForceRebootUrl' `
+    -OutFile `$File `
+    -ErrorAction Stop
+
+& `$File
+
+exit `$LASTEXITCODE
+"@
+
+    Set-Content `
+        -Path $RebootHelperScript `
+        -Value $Content `
+        -Encoding UTF8
+}
+
+
+# =====================================================================
+# REBOOT TASK PLANNEN
+# =====================================================================
+
+function Install-RebootTask {
+
+    param(
+        [Parameter(Mandatory)]
+        [string]$KB,
+
+        [Parameter(Mandatory)]
+        [string]$PackageName
+    )
+
+    Install-RebootHelper
+
+    $Now = Get-Date
+
+    $Start = Get-Date `
+        -Year $Now.Year `
+        -Month $Now.Month `
+        -Day $Now.Day `
+        -Hour 1 `
+        -Minute 0 `
+        -Second 0
+
+    if ($Start -le $Now) {
+
+        $Start = $Start.AddDays(1)
+    }
+
+    $ActionArgs = (
+        '-NoProfile ' +
+        '-NonInteractive ' +
+        '-ExecutionPolicy Bypass ' +
+        '-File "' +
+        $RebootHelperScript +
+        '"'
+    )
+
+    $Action = New-ScheduledTaskAction `
+        -Execute 'powershell.exe' `
+        -Argument $ActionArgs
+
+    $Trigger = New-ScheduledTaskTrigger `
+        -Once `
+        -At $Start `
+        -RepetitionInterval (
+            New-TimeSpan -Minutes 15
+        ) `
+        -RepetitionDuration (
+            New-TimeSpan -Hours 4
+        )
+
+    $Principal = New-ScheduledTaskPrincipal `
+        -UserId 'SYSTEM' `
+        -LogonType ServiceAccount `
+        -RunLevel Highest
+
+    $Settings = New-ScheduledTaskSettingsSet `
+        -StartWhenAvailable `
+        -ExecutionTimeLimit (
+            New-TimeSpan -Minutes 10
+        ) `
+        -MultipleInstances IgnoreNew
+
+    Register-ScheduledTask `
+        -TaskName $RebootTaskName `
+        -Action $Action `
+        -Trigger $Trigger `
+        -Principal $Principal `
+        -Settings $Settings `
+        -Description (
+            "Webstate - reboot na rollback $KB. " +
+            'Alleen veilig volgens usersessiecontrole.'
+        ) `
+        -Force |
+    Out-Null
+
+    Set-Content `
+        -Path $RollbackRebootFile `
+        -Value $Start.ToString('yyyy-MM-dd HH:mm:ss') `
+        -Encoding ASCII
+
+    Write-Log (
+        'Reboot gepland vanaf {0}.' -f
+        $Start.ToString('yyyy-MM-dd HH:mm:ss')
+    )
+
+    Write-Log (
+        'Bij blokkerende users wordt iedere 15 minuten opnieuw geprobeerd.'
+    )
+
+    Write-Log (
+        'Vanaf 05:00 wordt door de reboot-helper niet meer gereboot.'
+    )
+}
+
+
+# =====================================================================
+# GUARD REFRESH
+# =====================================================================
+
+function Invoke-GuardRefresh {
+
+    $GuardUrl =
+        'http://provisioning.webstate.nl/snom/_D7/WindowsUpdateKBGuard.ps1.txt'
+
+    $GuardFile =
+        Join-Path $RootDir 'WindowsUpdateKBGuard.ps1'
+
+    try {
+
+        Invoke-RestMethod `
+            -Uri $GuardUrl `
+            -OutFile $GuardFile `
+            -ErrorAction Stop
+
+        & $GuardFile -Mode Guard
+    }
+    catch {
+
+        Write-Log (
+            'WAARSCHUWING: Guard refresh mislukt: ' +
+            $_.Exception.Message
+        )
+    }
+}
+
+
+# =====================================================================
+# NAMED MUTEX
+# =====================================================================
+
+$Mutex     = $null
+$HaveMutex = $false
+
+
+try {
+
+    try {
+
+        $Mutex = [System.Threading.Mutex]::new(
+            $false,
+            $MutexName
+        )
+
+        try {
+
+            $HaveMutex = $Mutex.WaitOne(
+                0,
+                $false
+            )
+        }
+        catch [System.Threading.AbandonedMutexException] {
+
+            $HaveMutex = $true
+
+            Write-Log (
+                'Abandoned named mutex overgenomen. ' +
+                'Vorige rollback-instance is onverwacht gestopt.'
+            )
+        }
+    }
+    catch {
+
+        Write-Log (
+            'FOUT: named mutex kon niet worden aangemaakt: ' +
+            $_.Exception.Message
+        )
+
+        exit 50
+    }
+
+    if (-not $HaveMutex) {
+
+        Write-Log (
+            'SKIP: er draait reeds een andere rollback-instance ' +
+            '(named mutex is actief).'
+        )
+
+        exit 0
+    }
+
+    Write-Log (
+        'Named mutex verkregen: {0}' -f
+        $MutexName
+    )
+
+    Remove-LegacyLockFile
+
+
+    # =================================================================
+    # START
+    # =================================================================
+
+    Write-Log '============================================================'
+
+    Write-Log (
+        'RDS Problem KB rollback gestart - versie {0}' -f
+        $ScriptVersion
+    )
+
+    Write-Log (
+        'Computer: {0}' -f
+        $env:COMPUTERNAME
+    )
+
+    Write-Log (
+        'Account : {0}' -f
+        [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+    )
+
+
+    # =================================================================
+    # RDS CHECK
+    # =================================================================
+
+    if (-not (Test-IsRDSSessionHost)) {
+
+        Set-RollbackState `
+            -State 'NotRDS'
+
+        exit 0
+    }
+
+
+    # =================================================================
+    # OS / KB
+    # =================================================================
+
+    $OS = Get-CimInstance `
+        Win32_OperatingSystem `
+        -ErrorAction Stop
+
+    $Build = [int]$OS.BuildNumber
+
+    $TargetKB = Get-TargetKB `
+        -Build $Build
+
+    Write-Log (
+        'OS       : {0}' -f
+        $OS.Caption
+    )
+
+    Write-Log (
+        'Build    : {0}' -f
+        $Build
+    )
+
+    if (-not $TargetKB) {
+
+        Write-Log (
+            'SKIP: build {0} heeft geen geconfigureerde problematische KB.' -f
+            $Build
+        )
+
+        Set-RollbackState `
+            -State 'NotApplicable'
+
+        exit 0
+    }
+
+    Write-Log (
+        'Target KB: {0}' -f
+        $TargetKB
+    )
+
+    Set-Content `
+        -Path $RollbackKBFile `
+        -Value $TargetKB `
+        -Encoding ASCII
+
+    Set-Content `
+        -Path $RollbackVersionFile `
+        -Value $ScriptVersion `
+        -Encoding ASCII
+
+
+    # =================================================================
+    # HOTFIX CHECK
+    # =================================================================
+
+    $HotFix = Get-HotFix `
+        -Id $TargetKB `
+        -ErrorAction SilentlyContinue
+
+    if ($HotFix) {
+
+        Write-Log (
+            'PROBLEEM: {0} is door Get-HotFix als geïnstalleerd gevonden.' -f
+            $TargetKB
+        )
+
+        Write-Log (
+            'InstalledOn: {0}' -f
+            $HotFix.InstalledOn
+        )
+    }
+    else {
+
+        Write-Log (
+            '{0} wordt niet door Get-HotFix als Installed gerapporteerd.' -f
+            $TargetKB
+        )
+    }
+
+
+    # =================================================================
+    # CBS PACKAGE ZOEKEN
+    # =================================================================
+
+    $Package = Find-ExactRollupPackage `
+        -KB $TargetKB
+
+
+    # =================================================================
+    # GEEN PACKAGE + GEEN HOTFIX
+    # =================================================================
+
+    if (
+        -not $Package -and
+        -not $HotFix
+    ) {
+
+        Write-Log (
+            '{0} is niet meer geïnstalleerd en er is geen actief ' +
+            'CBS RollupFix-package gevonden.' -f
+            $TargetKB
+        )
+
+        Set-RollbackState `
+            -State 'OK' `
+            -KB $TargetKB `
+            -Message 'Target KB is niet geïnstalleerd.'
+
+        Invoke-GuardRefresh
+
+        exit 0
+    }
+
+
+    # =================================================================
+    # HOTFIX INSTALLED, PACKAGE NIET VEILIG BEPAALBAAR
+    # =================================================================
+
+    if (-not $Package) {
+
+        Write-Log (
+            'STOP: {0} is geïnstalleerd, maar het exacte CBS ' +
+            'RollupFix-package kon niet veilig worden bepaald.' -f
+            $TargetKB
+        )
+
+        Set-RollbackState `
+            -State 'PackageMappingMissing' `
+            -KB $TargetKB `
+            -Message (
+                'Exact CBS package kon niet veilig worden bepaald.'
+            )
+
+        exit 40
+    }
+
+
+    $PackageName =
+        [string]$Package.PackageName
+
+    $PackageState =
+        [string]$Package.PackageState
+
+    Write-Log (
+        'Exacte package geselecteerd: {0}' -f
+        $PackageName
+    )
+
+    Write-Log (
+        'PackageState: {0}' -f
+        $PackageState
+    )
+
+    Set-Content `
+        -Path $RollbackPackageFile `
+        -Value $PackageName `
+        -Encoding ASCII
+
+
+    # =================================================================
+    # AL UNINSTALLPENDING
+    # =================================================================
+
+    if ($PackageState -eq 'UninstallPending') {
+
+        Write-Log (
+            'CBS package staat reeds op UninstallPending.'
+        )
+
+        Write-Log (
+            'Geen tweede Remove-WindowsPackage uitvoeren.'
+        )
+
+        Remove-StaleRollbackTasks
+
+        Install-RebootTask `
+            -KB $TargetKB `
+            -PackageName $PackageName
+
+        Set-RollbackState `
+            -State 'RebootScheduled' `
+            -KB $TargetKB `
+            -Package $PackageName `
+            -Message (
+                'CBS package is UninstallPending; reboot vereist.'
+            )
+
+        Write-Log (
+            'KLAAR: uninstall was reeds pending; reboot opnieuw gepland.'
+        )
+
+        exit 0
+    }
+
+
+    # =================================================================
+    # PACKAGE MOET INSTALLED ZIJN
+    # =================================================================
+
+    if ($PackageState -ne 'Installed') {
+
+        Write-Log (
+            'STOP: onverwachte PackageState ''{0}''.' -f
+            $PackageState
+        )
+
+        Set-RollbackState `
+            -State 'UnexpectedPackageState' `
+            -KB $TargetKB `
+            -Package $PackageName `
+            -Message (
+                'Unexpected PackageState: {0}' -f
+                $PackageState
+            )
+
+        exit 41
+    }
+
+
+    # =================================================================
+    # OUDE TASKS WEG
+    # =================================================================
+
+    Remove-StaleRollbackTasks
+
+
+    # =================================================================
+    # NATIVE UNINSTALL
+    # =================================================================
+
+    Set-RollbackState `
+        -State 'Uninstalling' `
+        -KB $TargetKB `
+        -Package $PackageName `
+        -Message 'Native CBS uninstall wordt uitgevoerd.'
+
+    Write-Log (
+        'Remove-WindowsPackage: {0}' -f
+        $PackageName
+    )
+
+    try {
+
+        $RemoveResult = Remove-WindowsPackage `
+            -Online `
+            -PackageName $PackageName `
+            -NoRestart `
+            -ErrorAction Stop
+
+        Write-Log (
+            'Remove-WindowsPackage is zonder PowerShell-exception afgerond.'
+        )
+
+        if ($RemoveResult) {
+
+            try {
+
+                Write-Log (
+                    'RestartNeeded resultaat: {0}' -f
+                    $RemoveResult.RestartNeeded
+                )
+            }
+            catch {
+            }
+        }
+    }
+    catch {
+
+        Write-Log (
+            'UNINSTALL MISLUKT: ' +
+            $_.Exception.Message
+        )
+
+        Set-RollbackState `
+            -State 'UninstallFailed' `
+            -KB $TargetKB `
+            -Package $PackageName `
+            -Message $_.Exception.Message
+
+        exit 42
+    }
+
+
+    # =================================================================
+    # CBS STATUS OPNIEUW CONTROLEREN
+    # =================================================================
+
+    Start-Sleep -Seconds 3
+
+    $AfterPackage = Get-WindowsPackage `
+        -Online `
+        -PackageName $PackageName `
+        -ErrorAction SilentlyContinue |
+    Select-Object -First 1
+
+    if ($AfterPackage) {
+
+        $AfterState =
+            [string]$AfterPackage.PackageState
+
+        Write-Log (
+            'PackageState na uninstall: {0}' -f
+            $AfterState
+        )
+
+        if ($AfterState -eq 'Installed') {
+
+            Write-Log (
+                'UNINSTALL MISLUKT: package staat na ' +
+                'Remove-WindowsPackage nog steeds op Installed.'
+            )
+
+            Set-RollbackState `
+                -State 'UninstallFailed' `
+                -KB $TargetKB `
+                -Package $PackageName `
+                -Message (
+                    'Package bleef Installed na Remove-WindowsPackage.'
+                )
+
+            exit 43
+        }
+
+        if ($AfterState -ne 'UninstallPending') {
+
+            Write-Log (
+                'STOP: onverwachte PackageState na uninstall: {0}' -f
+                $AfterState
+            )
+
+            Set-RollbackState `
+                -State 'UninstallVerificationFailed' `
+                -KB $TargetKB `
+                -Package $PackageName `
+                -Message (
+                    'Unexpected post-uninstall PackageState: {0}' -f
+                    $AfterState
+                )
+
+            exit 44
+        }
+
+        Write-Log (
+            'CBS bevestigt UninstallPending.'
+        )
+    }
+    else {
+
+        Write-Log (
+            'CBS package wordt na Remove-WindowsPackage niet meer geretourneerd.'
+        )
+
+        Write-Log (
+            'Uninstall wordt als geaccepteerd beschouwd; ' +
+            'postboot Guard doet de definitieve controle.'
+        )
+    }
+
+
+    # =================================================================
+    # REBOOT PLANNEN
+    # =================================================================
+
+    Install-RebootTask `
+        -KB $TargetKB `
+        -PackageName $PackageName
+
+    Set-RollbackState `
+        -State 'RebootScheduled' `
+        -KB $TargetKB `
+        -Package $PackageName `
+        -Message (
+            'Native CBS uninstall geaccepteerd; reboot vereist.'
+        )
+
+    Write-Log (
+        'KLAAR: native rollback van {0} is door CBS geaccepteerd.' -f
+        $TargetKB
+    )
+
+    Write-Log (
+        'rollback-state.txt = RebootScheduled'
+    )
+
+    Write-Log (
+        'De KB kan tot de reboot nog door Get-HotFix als Installed worden getoond.'
+    )
+
+    exit 0
+}
+catch {
+
+    Write-Log (
+        'ONVERWACHTE FOUT: ' +
+        $_.Exception.Message
+    )
+
+    try {
+
+        Set-RollbackState `
+            -State 'Error' `
+            -Message $_.Exception.Message
+    }
+    catch {
+    }
+
+    exit 50
+}
+finally {
+
+    if (
+        $HaveMutex -and
+        $Mutex
+    ) {
+
+        try {
+
+            $Mutex.ReleaseMutex()
+        }
+        catch {
+        }
+    }
+
+    if ($Mutex) {
+
+        try {
+
+            $Mutex.Dispose()
+        }
+        catch {
+        }
+    }
+}

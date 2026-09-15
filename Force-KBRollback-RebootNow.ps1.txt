@@ -1,0 +1,1946 @@
+#Requires -Version 5.1
+
+[CmdletBinding()]
+param (
+    [switch]$CheckOnly
+)
+
+$ErrorActionPreference = 'Stop'
+$ProgressPreference    = 'SilentlyContinue'
+
+
+# =====================================================================
+# CONFIGURATIE
+# =====================================================================
+
+$ScriptVersion = '4.0.1-CBS-PREFLIGHT-EVENT24XML'
+
+$BaseDir = 'C:\ProgramData\Webstate\WindowsUpdateGuard'
+
+$RollbackStateFile   = Join-Path $BaseDir 'rollback-state.txt'
+$RollbackKBFile      = Join-Path $BaseDir 'rollback-kb.txt'
+$RollbackPackageFile = Join-Path $BaseDir 'rollback-package.txt'
+$RollbackVersionFile = Join-Path $BaseDir 'rollback-version.txt'
+$RollbackRebootFile  = Join-Path $BaseDir 'rollback-reboot.txt'
+
+$LogFile        = Join-Path $BaseDir 'rollback.log'
+$PostBootScript = Join-Path $BaseDir 'PostBoot-KBGuard.ps1'
+
+$RebootTaskName   = 'Webstate - Reboot after Windows Update rollback'
+$PostBootTaskName = 'Webstate - KB Guard after rollback'
+
+$GuardUrl  = 'http://provisioning.webstate.nl/snom/_D7/WindowsUpdateKBGuard.ps1.txt'
+$GuardFile = 'C:\ProgramData\Webstate\WindowsUpdateGuard.ps1'
+
+$MinimumDisconnectedMinutes = 60
+
+
+# =====================================================================
+# BASIS
+# =====================================================================
+
+New-Item `
+    -ItemType Directory `
+    -Path $BaseDir `
+    -Force |
+Out-Null
+
+
+function Write-Log {
+
+    param(
+        [Parameter(Mandatory)]
+        [string]$Message
+    )
+
+    $Line = (
+        "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') " +
+        "- MANUALREBOOT - $Message"
+    )
+
+    Add-Content `
+        -Path $LogFile `
+        -Value $Line `
+        -Encoding UTF8
+
+    Write-Host $Line
+}
+
+
+function Get-TextFileValue {
+
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    if (-not (Test-Path $Path)) {
+        return ''
+    }
+
+    try {
+
+        return (
+            Get-Content `
+                -Path $Path `
+                -Raw `
+                -ErrorAction Stop
+        ).Trim()
+
+    }
+    catch {
+
+        return ''
+    }
+}
+
+
+function Get-WtsStateName {
+
+    param(
+        [int]$State
+    )
+
+    switch ($State) {
+
+        0 { 'Active' }
+        1 { 'Connected' }
+        2 { 'ConnectQuery' }
+        3 { 'Shadow' }
+        4 { 'Disconnected' }
+        5 { 'Idle' }
+        6 { 'Listen' }
+        7 { 'Reset' }
+        8 { 'Down' }
+        9 { 'Init' }
+
+        default {
+            "Unknown($State)"
+        }
+    }
+}
+
+
+function ConvertTo-LdapFilterValue {
+
+    param(
+        [Parameter(Mandatory)]
+        [string]$Value
+    )
+
+    $Builder = New-Object System.Text.StringBuilder
+
+    foreach ($Character in $Value.ToCharArray()) {
+
+        switch ([int][char]$Character) {
+
+            0 {
+                [void]$Builder.Append('\00')
+            }
+
+            40 {
+                [void]$Builder.Append('\28')
+            }
+
+            41 {
+                [void]$Builder.Append('\29')
+            }
+
+            42 {
+                [void]$Builder.Append('\2a')
+            }
+
+            92 {
+                [void]$Builder.Append('\5c')
+            }
+
+            default {
+                [void]$Builder.Append($Character)
+            }
+        }
+    }
+
+    return $Builder.ToString()
+}
+
+
+# =====================================================================
+# HEADER / ROLLBACK STATUS
+# =====================================================================
+
+$RollbackState =
+    Get-TextFileValue `
+        -Path $RollbackStateFile
+
+$TargetKB =
+    Get-TextFileValue `
+        -Path $RollbackKBFile
+
+$RollbackPackage =
+    Get-TextFileValue `
+        -Path $RollbackPackageFile
+
+$RollbackVersion =
+    Get-TextFileValue `
+        -Path $RollbackVersionFile
+
+
+Write-Host ''
+Write-Host '============================================================'
+Write-Host ' WEBSTATE - DIRECTE KB ROLLBACK REBOOT'
+Write-Host '============================================================'
+Write-Host ''
+Write-Host "Script version  : $ScriptVersion"
+Write-Host "Computer        : $env:COMPUTERNAME"
+Write-Host "Rollback state  : $RollbackState"
+Write-Host "Target KB       : $TargetKB"
+Write-Host "Rollback package: $RollbackPackage"
+Write-Host "Rollback versie : $RollbackVersion"
+Write-Host "CheckOnly       : $CheckOnly"
+Write-Host ''
+
+
+if (
+    $RollbackState -notin @(
+        'RebootScheduled',
+        'UninstalledPendingReboot',
+        'RebootingNow',
+        'PostBootVerificationFailed'
+    )
+) {
+
+    throw (
+        "STOP: rollback-state '$RollbackState' is niet geschikt " +
+        "voor deze directe rebootprocedure."
+    )
+}
+
+
+if (-not $TargetKB) {
+
+    throw 'STOP: rollback-kb.txt ontbreekt of is leeg.'
+}
+
+
+# =====================================================================
+# CRUCIALE NIEUWE CONTROLE
+#
+# RebootScheduled alleen is GEEN bewijs dat de uninstall gelukt is.
+#
+# We eisen:
+#
+#   CBS package = UninstallPending
+#
+# OF
+#
+#   CBS package bestaat niet meer EN Get-HotFix ziet KB ook niet meer.
+#
+# Package = Installed betekent:
+#
+#   NOOIT REBOOTEN VIA DEZE TOOL.
+# =====================================================================
+
+$RollbackReadyForReboot = $false
+
+
+$HotFixStillInstalled = $false
+
+
+try {
+
+    $HotFix = Get-HotFix `
+        -Id $TargetKB `
+        -ErrorAction SilentlyContinue
+
+    if ($HotFix) {
+
+        $HotFixStillInstalled = $true
+    }
+
+}
+catch {
+
+    $HotFixStillInstalled = $false
+}
+
+
+if (-not $RollbackPackage) {
+
+    Write-Log (
+        'GEEN REBOOT: rollback-package.txt ontbreekt. ' +
+        'Dit is waarschijnlijk een RebootScheduled-status uit de oude ' +
+        'PSWindowsUpdate rollback.'
+    )
+
+
+    if (-not $CheckOnly) {
+
+        Set-Content `
+            -Path $RollbackStateFile `
+            -Value 'UninstallRequired' `
+            -Encoding ASCII
+    }
+
+
+    Write-Host ''
+    Write-Host '============================================================' -ForegroundColor Red
+    Write-Host ' GEEN REBOOT - EERST NIEUWE DISM ROLLBACK UITVOEREN' -ForegroundColor Red
+    Write-Host '============================================================' -ForegroundColor Red
+    Write-Host ''
+    Write-Host "Target KB: $TargetKB"
+    Write-Host 'rollback-package.txt ontbreekt.'
+    Write-Host ''
+    Write-Host 'Start eerst de actuele Remove-ProblemKB-RDS.ps1.'
+    Write-Host ''
+
+    exit 3
+}
+
+
+$Package = $null
+
+
+try {
+
+    $Package = Get-WindowsPackage `
+        -Online `
+        -PackageName $RollbackPackage `
+        -ErrorAction SilentlyContinue |
+    Select-Object -First 1
+
+}
+catch {
+
+    Write-Log (
+        "GEEN REBOOT: CBS packagecontrole gaf een fout: " +
+        "$($_.Exception.Message)"
+    )
+
+    exit 3
+}
+
+
+if ($Package) {
+
+    $PackageState =
+        [string]$Package.PackageState
+
+
+    Write-Log (
+        "CBS preflight: Package=$RollbackPackage " +
+        "State=$PackageState HotFixInstalled=$HotFixStillInstalled"
+    )
+
+
+    switch ($PackageState) {
+
+        'UninstallPending' {
+
+            Write-Log (
+                'CBS bevestigt UninstallPending. ' +
+                'Rollback is klaar voor reboot.'
+            )
+
+            $RollbackReadyForReboot = $true
+        }
+
+
+        'Installed' {
+
+            Write-Log (
+                "GEEN REBOOT: $TargetKB CBS-package staat nog Installed. " +
+                'De uninstall is niet uitgevoerd of niet geaccepteerd.'
+            )
+
+
+            if (-not $CheckOnly) {
+
+                Set-Content `
+                    -Path $RollbackStateFile `
+                    -Value 'UninstallRequired' `
+                    -Encoding ASCII
+            }
+
+
+            Write-Host ''
+            Write-Host '============================================================' -ForegroundColor Red
+            Write-Host ' GEEN REBOOT - KB IS NOG GEINSTALLEERD' -ForegroundColor Red
+            Write-Host '============================================================' -ForegroundColor Red
+            Write-Host ''
+            Write-Host "KB           : $TargetKB"
+            Write-Host "CBS package  : $RollbackPackage"
+            Write-Host "PackageState : $PackageState"
+            Write-Host ''
+            Write-Host 'Eerst de actuele native DISM rollback uitvoeren.'
+            Write-Host ''
+
+            exit 3
+        }
+
+
+        default {
+
+            Write-Log (
+                "GEEN REBOOT: onverwachte CBS PackageState '$PackageState'. " +
+                'Fail closed.'
+            )
+
+
+            Write-Host ''
+            Write-Host "Onverwachte PackageState: $PackageState"
+            Write-Host 'Geen reboot uitgevoerd.'
+            Write-Host ''
+
+            exit 3
+        }
+    }
+
+}
+else {
+
+    # Package bestaat niet meer.
+    #
+    # Alleen veilig wanneer Get-HotFix de target KB eveneens
+    # niet meer als geïnstalleerd rapporteert.
+
+    if (-not $HotFixStillInstalled) {
+
+        Write-Log (
+            'CBS package bestaat niet meer en Get-HotFix ziet ' +
+            "$TargetKB niet meer. Reboot toegestaan."
+        )
+
+        $RollbackReadyForReboot = $true
+
+    }
+    else {
+
+        Write-Log (
+            "GEEN REBOOT: CBS package '$RollbackPackage' werd niet gevonden, " +
+            "maar Get-HotFix rapporteert $TargetKB nog als Installed."
+        )
+
+
+        if (-not $CheckOnly) {
+
+            Set-Content `
+                -Path $RollbackStateFile `
+                -Value 'UninstallRequired' `
+                -Encoding ASCII
+        }
+
+
+        exit 3
+    }
+}
+
+
+if (-not $RollbackReadyForReboot) {
+
+    throw 'STOP: rollback is niet veilig gereed voor reboot.'
+}
+
+
+# =====================================================================
+# WTS API
+# =====================================================================
+
+if (-not ('WebstateWtsApiV4' -as [type])) {
+
+    Add-Type @"
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+
+public class WebstateWtsSessionV4
+{
+    public int SessionId;
+    public string UserName;
+    public string DomainName;
+    public int State;
+}
+
+public static class WebstateWtsApiV4
+{
+    public enum WTS_CONNECTSTATE_CLASS
+    {
+        WTSActive = 0,
+        WTSConnected = 1,
+        WTSConnectQuery = 2,
+        WTSShadow = 3,
+        WTSDisconnected = 4,
+        WTSIdle = 5,
+        WTSListen = 6,
+        WTSReset = 7,
+        WTSDown = 8,
+        WTSInit = 9
+    }
+
+    public enum WTS_INFO_CLASS
+    {
+        WTSInitialProgram = 0,
+        WTSApplicationName = 1,
+        WTSWorkingDirectory = 2,
+        WTSOEMId = 3,
+        WTSSessionId = 4,
+        WTSUserName = 5,
+        WTSWinStationName = 6,
+        WTSDomainName = 7,
+        WTSConnectState = 8
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct WTS_SESSION_INFO
+    {
+        public int SessionID;
+        public IntPtr pWinStationName;
+        public WTS_CONNECTSTATE_CLASS State;
+    }
+
+    [DllImport(
+        "wtsapi32.dll",
+        EntryPoint = "WTSEnumerateSessionsW",
+        CharSet = CharSet.Unicode,
+        SetLastError = true,
+        ExactSpelling = true
+    )]
+    private static extern bool WTSEnumerateSessions(
+        IntPtr hServer,
+        int Reserved,
+        int Version,
+        out IntPtr ppSessionInfo,
+        out int pCount
+    );
+
+    [DllImport(
+        "wtsapi32.dll",
+        EntryPoint = "WTSQuerySessionInformationW",
+        CharSet = CharSet.Unicode,
+        SetLastError = true,
+        ExactSpelling = true
+    )]
+    private static extern bool WTSQuerySessionInformation(
+        IntPtr hServer,
+        int sessionId,
+        WTS_INFO_CLASS wtsInfoClass,
+        out IntPtr ppBuffer,
+        out int pBytesReturned
+    );
+
+    [DllImport("wtsapi32.dll")]
+    private static extern void WTSFreeMemory(
+        IntPtr pMemory
+    );
+
+    private static string QueryString(
+        int sessionId,
+        WTS_INFO_CLASS infoClass
+    )
+    {
+        IntPtr buffer = IntPtr.Zero;
+        int bytes = 0;
+
+        try
+        {
+            if (!WTSQuerySessionInformation(
+                IntPtr.Zero,
+                sessionId,
+                infoClass,
+                out buffer,
+                out bytes))
+            {
+                return "";
+            }
+
+            if (buffer == IntPtr.Zero)
+                return "";
+
+            return Marshal.PtrToStringUni(buffer) ?? "";
+        }
+        finally
+        {
+            if (buffer != IntPtr.Zero)
+                WTSFreeMemory(buffer);
+        }
+    }
+
+    public static WebstateWtsSessionV4[] GetSessions()
+    {
+        IntPtr buffer = IntPtr.Zero;
+        int count = 0;
+
+        List<WebstateWtsSessionV4> result =
+            new List<WebstateWtsSessionV4>();
+
+        if (!WTSEnumerateSessions(
+            IntPtr.Zero,
+            0,
+            1,
+            out buffer,
+            out count))
+        {
+            throw new System.ComponentModel.Win32Exception(
+                Marshal.GetLastWin32Error()
+            );
+        }
+
+        try
+        {
+            int size =
+                Marshal.SizeOf(
+                    typeof(WTS_SESSION_INFO)
+                );
+
+            long current =
+                buffer.ToInt64();
+
+            for (int i = 0; i < count; i++)
+            {
+                WTS_SESSION_INFO info =
+                    (WTS_SESSION_INFO)Marshal.PtrToStructure(
+                        new IntPtr(current),
+                        typeof(WTS_SESSION_INFO)
+                    );
+
+                string user =
+                    QueryString(
+                        info.SessionID,
+                        WTS_INFO_CLASS.WTSUserName
+                    );
+
+                string domain =
+                    QueryString(
+                        info.SessionID,
+                        WTS_INFO_CLASS.WTSDomainName
+                    );
+
+                if (!String.IsNullOrWhiteSpace(user))
+                {
+                    WebstateWtsSessionV4 record =
+                        new WebstateWtsSessionV4();
+
+                    record.SessionId = info.SessionID;
+                    record.UserName = user;
+                    record.DomainName = domain;
+                    record.State = (int)info.State;
+
+                    result.Add(record);
+                }
+
+                current += size;
+            }
+        }
+        finally
+        {
+            if (buffer != IntPtr.Zero)
+                WTSFreeMemory(buffer);
+        }
+
+        return result.ToArray();
+    }
+}
+"@
+}
+
+
+# =====================================================================
+# DOMAIN CONTEXT
+# =====================================================================
+
+function Get-WebstateDomainContext {
+
+    $RootDse     = $null
+    $DomainEntry = $null
+    $Partitions  = $null
+    $Searcher    = $null
+
+    try {
+
+        $RootDse = New-Object `
+            System.DirectoryServices.DirectoryEntry(
+                'LDAP://RootDSE'
+            )
+
+
+        $DefaultNamingContext = [string](
+            $RootDse.Properties[
+                'defaultNamingContext'
+            ][0]
+        )
+
+
+        $ConfigurationNamingContext = [string](
+            $RootDse.Properties[
+                'configurationNamingContext'
+            ][0]
+        )
+
+
+        if (-not $DefaultNamingContext) {
+
+            throw 'defaultNamingContext ontbreekt.'
+        }
+
+
+        $DomainEntry = New-Object `
+            System.DirectoryServices.DirectoryEntry(
+                "LDAP://$DefaultNamingContext"
+            )
+
+
+        $DomainSidBytes =
+            $DomainEntry.Properties[
+                'objectSid'
+            ][0]
+
+
+        if (-not $DomainSidBytes) {
+
+            throw 'Domain SID ontbreekt.'
+        }
+
+
+        $DomainSid = New-Object `
+            System.Security.Principal.SecurityIdentifier(
+                $DomainSidBytes,
+                0
+            )
+
+
+        $NetBIOSDomain = ''
+
+
+        if ($ConfigurationNamingContext) {
+
+            try {
+
+                $Partitions = New-Object `
+                    System.DirectoryServices.DirectoryEntry(
+                        "LDAP://CN=Partitions,$ConfigurationNamingContext"
+                    )
+
+
+                $Searcher = New-Object `
+                    System.DirectoryServices.DirectorySearcher(
+                        $Partitions
+                    )
+
+
+                $EscapedNC =
+                    ConvertTo-LdapFilterValue `
+                        -Value $DefaultNamingContext
+
+
+                $Searcher.Filter =
+                    "(&(objectClass=crossRef)(nCName=$EscapedNC))"
+
+
+                [void]$Searcher.PropertiesToLoad.Add(
+                    'nETBIOSName'
+                )
+
+
+                $Result =
+                    $Searcher.FindOne()
+
+
+                if (
+                    $Result -and
+                    $Result.Properties[
+                        'netbiosname'
+                    ].Count -gt 0
+                ) {
+
+                    $NetBIOSDomain =
+                        [string]$Result.Properties[
+                            'netbiosname'
+                        ][0]
+                }
+
+            }
+            catch {
+
+                $NetBIOSDomain = ''
+            }
+        }
+
+
+        try {
+
+            $DnsDomain = (
+                [System.DirectoryServices.ActiveDirectory.Domain]::GetComputerDomain()
+            ).Name
+
+        }
+        catch {
+
+            $DnsDomain = ''
+        }
+
+
+        return [pscustomobject]@{
+
+            DefaultNamingContext =
+                $DefaultNamingContext
+
+            DnsDomain =
+                $DnsDomain
+
+            NetBIOSDomain =
+                $NetBIOSDomain
+
+            DomainSid =
+                $DomainSid.Value
+
+            DomainAdminsSid =
+                "$($DomainSid.Value)-512"
+        }
+
+    }
+    finally {
+
+        if ($Searcher) {
+            $Searcher.Dispose()
+        }
+
+        if ($Partitions) {
+            $Partitions.Dispose()
+        }
+
+        if ($DomainEntry) {
+            $DomainEntry.Dispose()
+        }
+
+        if ($RootDse) {
+            $RootDse.Dispose()
+        }
+    }
+}
+
+
+# =====================================================================
+# DOMAIN ADMIN DETECTIE
+#
+# Geen tokenGroups.
+#
+# User:
+#   primaryGroupID=512
+# OF
+#   memberOf recursief → group SID = DOMAIN-SID-512
+# =====================================================================
+
+function Test-IsDomainAdmin {
+
+    param(
+
+        [Parameter(Mandatory)]
+        [string]$Domain,
+
+        [Parameter(Mandatory)]
+        [string]$UserName,
+
+        [Parameter(Mandatory)]
+        $DomainContext
+    )
+
+
+    $SearchRoot   = $null
+    $UserSearcher = $null
+
+
+    try {
+
+        $DomainMatches = $false
+
+
+        if (
+            $DomainContext.NetBIOSDomain -and
+            $Domain -ieq $DomainContext.NetBIOSDomain
+        ) {
+
+            $DomainMatches = $true
+        }
+
+
+        if (
+            $DomainContext.DnsDomain -and
+            $Domain -ieq $DomainContext.DnsDomain
+        ) {
+
+            $DomainMatches = $true
+        }
+
+
+        if (-not $DomainMatches) {
+
+            return $false
+        }
+
+
+        $SearchRoot = New-Object `
+            System.DirectoryServices.DirectoryEntry(
+                "LDAP://$($DomainContext.DefaultNamingContext)"
+            )
+
+
+        $EscapedUser =
+            ConvertTo-LdapFilterValue `
+                -Value $UserName
+
+
+        $UserSearcher = New-Object `
+            System.DirectoryServices.DirectorySearcher(
+                $SearchRoot
+            )
+
+
+        $UserSearcher.Filter = (
+            '(&' +
+                '(objectCategory=person)' +
+                '(objectClass=user)' +
+                "(sAMAccountName=$EscapedUser)" +
+            ')'
+        )
+
+
+        [void]$UserSearcher.PropertiesToLoad.Add(
+            'primaryGroupID'
+        )
+
+        [void]$UserSearcher.PropertiesToLoad.Add(
+            'memberOf'
+        )
+
+
+        $UserResult =
+            $UserSearcher.FindOne()
+
+
+        if (-not $UserResult) {
+
+            return $false
+        }
+
+
+        if (
+            $UserResult.Properties[
+                'primarygroupid'
+            ].Count -gt 0
+        ) {
+
+            if (
+                [int]$UserResult.Properties[
+                    'primarygroupid'
+                ][0] -eq 512
+            ) {
+
+                return $true
+            }
+        }
+
+
+        $Queue =
+            New-Object `
+                'System.Collections.Generic.Queue[string]'
+
+
+        $Visited =
+            New-Object `
+                'System.Collections.Generic.HashSet[string]' `
+                ([System.StringComparer]::OrdinalIgnoreCase)
+
+
+        foreach (
+            $GroupDN in
+            $UserResult.Properties[
+                'memberof'
+            ]
+        ) {
+
+            if ($GroupDN) {
+
+                $Queue.Enqueue(
+                    [string]$GroupDN
+                )
+            }
+        }
+
+
+        $ProcessedGroups = 0
+
+
+        while (
+            $Queue.Count -gt 0
+        ) {
+
+            $GroupDN =
+                $Queue.Dequeue()
+
+
+            if (
+                -not $Visited.Add(
+                    $GroupDN
+                )
+            ) {
+
+                continue
+            }
+
+
+            $ProcessedGroups++
+
+
+            if (
+                $ProcessedGroups -gt 1000
+            ) {
+
+                throw 'Meer dan 1000 groepen gevolgd.'
+            }
+
+
+            $GroupSearcher = $null
+
+
+            try {
+
+                $GroupSearcher = New-Object `
+                    System.DirectoryServices.DirectorySearcher(
+                        $SearchRoot
+                    )
+
+
+                $EscapedGroupDN =
+                    ConvertTo-LdapFilterValue `
+                        -Value $GroupDN
+
+
+                $GroupSearcher.Filter = (
+                    '(&' +
+                        '(objectCategory=group)' +
+                        "(distinguishedName=$EscapedGroupDN)" +
+                    ')'
+                )
+
+
+                [void]$GroupSearcher.PropertiesToLoad.Add(
+                    'objectSid'
+                )
+
+                [void]$GroupSearcher.PropertiesToLoad.Add(
+                    'memberOf'
+                )
+
+
+                $GroupResult =
+                    $GroupSearcher.FindOne()
+
+
+                if (-not $GroupResult) {
+
+                    continue
+                }
+
+
+                if (
+                    $GroupResult.Properties[
+                        'objectsid'
+                    ].Count -gt 0
+                ) {
+
+                    $GroupSid = New-Object `
+                        System.Security.Principal.SecurityIdentifier(
+                            $GroupResult.Properties[
+                                'objectsid'
+                            ][0],
+                            0
+                        )
+
+
+                    if (
+                        $GroupSid.Value -eq
+                        $DomainContext.DomainAdminsSid
+                    ) {
+
+                        return $true
+                    }
+                }
+
+
+                foreach (
+                    $ParentDN in
+                    $GroupResult.Properties[
+                        'memberof'
+                    ]
+                ) {
+
+                    if ($ParentDN) {
+
+                        $Queue.Enqueue(
+                            [string]$ParentDN
+                        )
+                    }
+                }
+
+            }
+            finally {
+
+                if ($GroupSearcher) {
+                    $GroupSearcher.Dispose()
+                }
+            }
+        }
+
+
+        return $false
+
+    }
+    catch {
+
+        Write-Log (
+            "WAARSCHUWING: Domain Admin-status van " +
+            "$Domain\$UserName kon niet betrouwbaar worden vastgesteld: " +
+            "$($_.Exception.Message)"
+        )
+
+
+        return $false
+
+    }
+    finally {
+
+        if ($UserSearcher) {
+            $UserSearcher.Dispose()
+        }
+
+        if ($SearchRoot) {
+            $SearchRoot.Dispose()
+        }
+    }
+}
+
+
+# =====================================================================
+# SESSIES OPHALEN
+# =====================================================================
+
+try {
+
+    $RawSessions = @(
+        [WebstateWtsApiV4]::GetSessions()
+    )
+
+}
+catch {
+
+    Write-Log (
+        "STOP: sessies konden niet worden uitgelezen: " +
+        "$($_.Exception.Message)"
+    )
+
+    exit 1
+}
+
+
+$DomainContext = $null
+
+
+try {
+
+    $DomainContext =
+        Get-WebstateDomainContext
+
+
+    Write-Log (
+        "AD domein: " +
+        "DNS=$($DomainContext.DnsDomain), " +
+        "NetBIOS=$($DomainContext.NetBIOSDomain), " +
+        "DomainAdminsSID=$($DomainContext.DomainAdminsSid)"
+    )
+
+}
+catch {
+
+    Write-Log (
+        'WAARSCHUWING: AD domeincontext niet beschikbaar. ' +
+        'Domain Admin-sessies worden niet genegeerd.'
+    )
+}
+
+
+$Sessions = @()
+
+
+foreach ($Session in $RawSessions) {
+
+    $FullUser = if ($Session.DomainName) {
+
+        "$($Session.DomainName)\$($Session.UserName)"
+
+    }
+    else {
+
+        $Session.UserName
+    }
+
+
+    $IsDomainAdmin = $false
+
+
+    if (
+        $DomainContext -and
+        $Session.DomainName -and
+        $Session.UserName
+    ) {
+
+        $IsDomainAdmin =
+            Test-IsDomainAdmin `
+                -Domain $Session.DomainName `
+                -UserName $Session.UserName `
+                -DomainContext $DomainContext
+    }
+
+
+    $Sessions += [pscustomobject]@{
+
+        SessionId =
+            $Session.SessionId
+
+        UserName =
+            $Session.UserName
+
+        DomainName =
+            $Session.DomainName
+
+        FullUser =
+            $FullUser
+
+        State =
+            $Session.State
+
+        StateName =
+            Get-WtsStateName `
+                -State $Session.State
+
+        IsDomainAdmin =
+            $IsDomainAdmin
+    }
+}
+
+
+Write-Host ''
+
+
+if ($Sessions.Count -eq 0) {
+
+    Write-Host 'Aangetroffen sessies: GEEN'
+
+}
+else {
+
+    Write-Host 'Aangetroffen sessies:' -ForegroundColor Cyan
+
+
+    foreach ($Session in $Sessions) {
+
+        $Role = if ($Session.IsDomainAdmin) {
+
+            'DOMAIN ADMIN - genegeerd'
+
+        }
+        else {
+
+            'USER'
+        }
+
+
+        Write-Host (
+            'User={0}  SessionID={1}  State={2}  Role={3}' -f
+            $Session.FullUser,
+            $Session.SessionId,
+            $Session.StateName,
+            $Role
+        )
+    }
+}
+
+
+Write-Host ''
+
+
+$IgnoredDomainAdminSessions = @(
+    $Sessions |
+    Where-Object {
+        $_.IsDomainAdmin
+    }
+)
+
+
+$RelevantSessions = @(
+    $Sessions |
+    Where-Object {
+        -not $_.IsDomainAdmin
+    }
+)
+
+
+foreach ($Session in $IgnoredDomainAdminSessions) {
+
+    Write-Log (
+        "DOMAIN ADMIN genegeerd voor rebootcontrole: " +
+        "$($Session.FullUser), " +
+        "Session=$($Session.SessionId), " +
+        "State=$($Session.StateName)"
+    )
+}
+
+
+# =====================================================================
+# REBOOTBESLISSING OP BASIS VAN USERS
+# =====================================================================
+
+$SafeToReboot = $false
+
+
+if ($RelevantSessions.Count -eq 0) {
+
+    if ($Sessions.Count -eq 0) {
+
+        Write-Log 'Geen aangemelde gebruikers gevonden.'
+
+    }
+    else {
+
+        Write-Log (
+            'Alle aanwezige sessies zijn Domain Admin-sessies. ' +
+            "Aantal genegeerd: $($IgnoredDomainAdminSessions.Count)."
+        )
+    }
+
+
+    Write-Log 'DIRECTE REBOOT TOEGESTAAN.'
+
+    $SafeToReboot = $true
+
+}
+else {
+
+    $NonDisconnected = @(
+        $RelevantSessions |
+        Where-Object {
+            $_.State -ne 4
+        }
+    )
+
+
+    if ($NonDisconnected.Count -gt 0) {
+
+        foreach ($Session in $NonDisconnected) {
+
+            Write-Log (
+                "GEEN REBOOT: $($Session.FullUser), " +
+                "Session=$($Session.SessionId), " +
+                "State=$($Session.StateName) is niet Disconnected."
+            )
+        }
+
+
+        $SafeToReboot = $false
+
+    }
+    else {
+
+        try {
+
+            $DisconnectEvents = @(
+                Get-WinEvent `
+                    -FilterHashtable @{
+                        LogName   = 'Microsoft-Windows-TerminalServices-LocalSessionManager/Operational'
+                        Id        = 24
+                        StartTime = (Get-Date).AddDays(-30)
+                    } `
+                    -ErrorAction Stop
+            )
+
+        }
+        catch {
+
+            Write-Log (
+                'GEEN REBOOT: disconnect-eventlog kon niet worden gelezen.'
+            )
+
+            exit 1
+        }
+
+
+        $Now          = Get-Date
+        $AllOldEnough = $true
+
+
+        foreach ($Session in $RelevantSessions) {
+
+            $DisconnectTime = $null
+
+
+            foreach ($Event in $DisconnectEvents) {
+
+                try {
+
+                    [xml]$Xml =
+                        $Event.ToXml()
+
+
+                    # Event ID 24 van TerminalServices-LocalSessionManager
+                    # bewaart User en SessionID op deze servers onder
+                    # UserData/EventXML, niet onder EventData. Gebruik XPath
+                    # met local-name() zodat de parsing niet afhankelijk is
+                    # van XML namespaces of de Windows-weergavetaal.
+
+                    $SessionIdNode =
+                        $Xml.SelectSingleNode(
+                            "/*[local-name()='Event']/*[local-name()='UserData']/*[local-name()='EventXML']/*[local-name()='SessionID']"
+                        )
+
+
+                    if (-not $SessionIdNode) {
+                        continue
+                    }
+
+
+                    if (
+                        [int]$SessionIdNode.InnerText -ne
+                        $Session.SessionId
+                    ) {
+
+                        continue
+                    }
+
+
+                    $EventUserNode =
+                        $Xml.SelectSingleNode(
+                            "/*[local-name()='Event']/*[local-name()='UserData']/*[local-name()='EventXML']/*[local-name()='User']"
+                        )
+
+
+                    if (-not $EventUserNode) {
+                        continue
+                    }
+
+
+                    $EventUser =
+                        [string]$EventUserNode.InnerText
+
+
+                    if (
+                        $EventUser -and
+                        $EventUser -ine $Session.FullUser -and
+                        $EventUser -ine $Session.UserName
+                    ) {
+
+                        continue
+                    }
+
+
+                    $DisconnectTime =
+                        $Event.TimeCreated
+
+
+                    break
+
+                }
+                catch {
+
+                    continue
+                }
+            }
+
+
+            if (-not $DisconnectTime) {
+
+                Write-Log (
+                    "GEEN REBOOT: disconnect-tijd van " +
+                    "$($Session.FullUser) kon niet betrouwbaar worden vastgesteld."
+                )
+
+
+                $AllOldEnough = $false
+
+                continue
+            }
+
+
+            $DisconnectedMinutes = [math]::Floor(
+                ($Now - $DisconnectTime).TotalMinutes
+            )
+
+
+            Write-Log (
+                "DISCONNECTED: $($Session.FullUser), " +
+                "Session=$($Session.SessionId), " +
+                "duur=$DisconnectedMinutes minuten."
+            )
+
+
+            if (
+                $DisconnectedMinutes -lt
+                $MinimumDisconnectedMinutes
+            ) {
+
+                Write-Log (
+                    "GEEN REBOOT: $($Session.FullUser) is pas " +
+                    "$DisconnectedMinutes minuten disconnected."
+                )
+
+
+                $AllOldEnough = $false
+            }
+        }
+
+
+        if ($AllOldEnough) {
+
+            Write-Log (
+                'Alle niet-Domain-Admin gebruikers zijn minimaal ' +
+                "$MinimumDisconnectedMinutes minuten Disconnected."
+            )
+
+
+            Write-Log 'DIRECTE REBOOT TOEGESTAAN.'
+
+            $SafeToReboot = $true
+        }
+    }
+}
+
+
+if (-not $SafeToReboot) {
+
+    Write-Host ''
+    Write-Host '============================================================' -ForegroundColor Red
+    Write-Host ' GEEN REBOOT - ER ZIJN BLOKKERENDE USERSESSIES' -ForegroundColor Red
+    Write-Host '============================================================' -ForegroundColor Red
+    Write-Host ''
+
+    exit 2
+}
+
+
+if ($CheckOnly) {
+
+    Write-Host ''
+    Write-Host '============================================================' -ForegroundColor Green
+    Write-Host ' REBOOT IS OP DIT MOMENT TOEGESTAAN' -ForegroundColor Green
+    Write-Host '============================================================' -ForegroundColor Green
+    Write-Host ''
+    Write-Host 'CBS rollback is gecontroleerd.'
+    Write-Host 'Usersessies zijn gecontroleerd.'
+    Write-Host 'Er is niets gewijzigd.'
+    Write-Host ''
+
+    exit 0
+}
+
+
+# =====================================================================
+# POSTBOOT FINALIZER
+# =====================================================================
+
+$PostBootContent = @'
+$ErrorActionPreference = 'SilentlyContinue'
+$ProgressPreference    = 'SilentlyContinue'
+
+$BaseDir = 'C:\ProgramData\Webstate\WindowsUpdateGuard'
+
+$LogFile        = Join-Path $BaseDir 'rollback.log'
+$RollbackFile   = Join-Path $BaseDir 'rollback-state.txt'
+$RollbackKBFile = Join-Path $BaseDir 'rollback-kb.txt'
+$RebootFile     = Join-Path $BaseDir 'rollback-reboot.txt'
+
+$InstalledFile  = Join-Path $BaseDir 'installed.txt'
+$ExitCodeFile   = Join-Path $BaseDir 'exitcode.txt'
+$StateFile      = Join-Path $BaseDir 'state.txt'
+$KBFile         = Join-Path $BaseDir 'targetkb.txt'
+
+$GuardUrl  = 'http://provisioning.webstate.nl/snom/_D7/WindowsUpdateKBGuard.ps1.txt'
+$GuardFile = 'C:\ProgramData\Webstate\WindowsUpdateGuard.ps1'
+
+$TaskName       = 'Webstate - KB Guard after rollback'
+$RebootTaskName = 'Webstate - Reboot after Windows Update rollback'
+
+
+function Write-PostLog {
+
+    param([string]$Message)
+
+    Add-Content `
+        -Path $LogFile `
+        -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - POSTBOOT - $Message" `
+        -Encoding UTF8
+}
+
+
+Write-PostLog 'Post-boot rollback-verificatie gestart.'
+
+Start-Sleep -Seconds 120
+
+
+$ExpectedKB = ''
+
+if (Test-Path $RollbackKBFile) {
+
+    $ExpectedKB = (
+        Get-Content `
+            $RollbackKBFile `
+            -Raw `
+            -ErrorAction SilentlyContinue
+    ).Trim()
+}
+
+
+$Success = $false
+
+
+for ($Attempt = 1; $Attempt -le 10; $Attempt++) {
+
+    Write-PostLog "Guard/verificatie poging $Attempt van 10."
+
+
+    try {
+
+        Invoke-RestMethod `
+            -Uri $GuardUrl `
+            -OutFile $GuardFile `
+            -ErrorAction Stop
+
+
+        Write-PostLog 'Laatste WindowsUpdateKBGuard gedownload.'
+
+
+        Remove-Item `
+            $ExitCodeFile,
+            $InstalledFile,
+            $StateFile,
+            $KBFile `
+            -Force `
+            -ErrorAction SilentlyContinue
+
+
+        & $GuardFile -Mode Guard
+
+
+        Start-Sleep -Seconds 5
+
+
+        if (-not (Test-Path $ExitCodeFile)) {
+            throw 'exitcode.txt ontbreekt.'
+        }
+
+        if (-not (Test-Path $InstalledFile)) {
+            throw 'installed.txt ontbreekt.'
+        }
+
+        if (-not (Test-Path $StateFile)) {
+            throw 'state.txt ontbreekt.'
+        }
+
+        if (-not (Test-Path $KBFile)) {
+            throw 'targetkb.txt ontbreekt.'
+        }
+
+
+        $ExitCode = (
+            Get-Content $ExitCodeFile -Raw
+        ).Trim()
+
+
+        $Installed = (
+            Get-Content $InstalledFile -Raw
+        ).Trim()
+
+
+        $GuardState = (
+            Get-Content $StateFile -Raw
+        ).Trim()
+
+
+        $GuardKB = (
+            Get-Content $KBFile -Raw
+        ).Trim()
+
+
+        Write-PostLog (
+            "Verification: " +
+            "ExpectedKB=$ExpectedKB " +
+            "GuardKB=$GuardKB " +
+            "ExitCode=$ExitCode " +
+            "Installed=$Installed " +
+            "GuardState=$GuardState"
+        )
+
+
+        if (
+            $ExpectedKB -and
+            $GuardKB -and
+            $ExpectedKB -ine $GuardKB
+        ) {
+
+            throw (
+                "KB mismatch: Expected=$ExpectedKB Guard=$GuardKB"
+            )
+        }
+
+
+        if (
+            $ExitCode -eq '0' -and
+            $Installed -eq '0'
+        ) {
+
+            Set-Content `
+                -Path $RollbackFile `
+                -Value 'OK' `
+                -Encoding ASCII
+
+
+            Set-Content `
+                -Path $RebootFile `
+                -Value "COMPLETED: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" `
+                -Encoding ASCII
+
+
+            Write-PostLog "$GuardKB is niet meer geïnstalleerd."
+            Write-PostLog 'rollback-state.txt = OK.'
+            Write-PostLog "Guard state = $GuardState."
+
+
+            $Success = $true
+
+            break
+        }
+
+
+        Write-PostLog 'Verificatie nog niet OK.'
+
+    }
+    catch {
+
+        Write-PostLog (
+            "Poging $Attempt fout: $($_.Exception.Message)"
+        )
+    }
+
+
+    if ($Attempt -lt 10) {
+
+        Start-Sleep -Seconds 60
+    }
+}
+
+
+if ($Success) {
+
+    Disable-ScheduledTask `
+        -TaskName $TaskName `
+        -ErrorAction SilentlyContinue |
+    Out-Null
+
+
+    Unregister-ScheduledTask `
+        -TaskName $RebootTaskName `
+        -Confirm:$false `
+        -ErrorAction SilentlyContinue
+
+
+    Write-PostLog 'Rollback volledig afgerond.'
+}
+else {
+
+    Set-Content `
+        -Path $RollbackFile `
+        -Value 'PostBootVerificationFailed' `
+        -Encoding ASCII
+
+
+    Write-PostLog (
+        'ERROR: probleem-KB kon niet als verwijderd worden bevestigd.'
+    )
+}
+'@
+
+
+Set-Content `
+    -Path $PostBootScript `
+    -Value $PostBootContent `
+    -Encoding UTF8
+
+
+Write-Log 'Post-boot finalizer geschreven.'
+
+
+# =====================================================================
+# POSTBOOT TASK
+# =====================================================================
+
+$PostBootArguments = (
+    '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' +
+    $PostBootScript +
+    '"'
+)
+
+
+$PostBootAction =
+    New-ScheduledTaskAction `
+        -Execute 'powershell.exe' `
+        -Argument $PostBootArguments
+
+
+$PostBootTrigger =
+    New-ScheduledTaskTrigger `
+        -AtStartup
+
+
+$PostBootPrincipal =
+    New-ScheduledTaskPrincipal `
+        -UserId 'SYSTEM' `
+        -LogonType ServiceAccount `
+        -RunLevel Highest
+
+
+$PostBootSettings =
+    New-ScheduledTaskSettingsSet `
+        -StartWhenAvailable `
+        -ExecutionTimeLimit (
+            New-TimeSpan -Minutes 30
+        ) `
+        -MultipleInstances IgnoreNew
+
+
+Register-ScheduledTask `
+    -TaskName $PostBootTaskName `
+    -Action $PostBootAction `
+    -Trigger $PostBootTrigger `
+    -Principal $PostBootPrincipal `
+    -Settings $PostBootSettings `
+    -Description 'Webstate - valideert problematische KB rollback na reboot.' `
+    -Force |
+Out-Null
+
+
+Write-Log (
+    "Post-boot taak '$PostBootTaskName' opnieuw geregistreerd."
+)
+
+
+# =====================================================================
+# BESTAANDE NACHTELIJKE REBOOT UITSCHAKELEN
+# =====================================================================
+
+$RebootTask = Get-ScheduledTask `
+    -TaskName $RebootTaskName `
+    -ErrorAction SilentlyContinue
+
+
+$RebootTaskWasEnabled = $false
+
+
+if (
+    $RebootTask -and
+    $RebootTask.State -ne 'Disabled'
+) {
+
+    $RebootTaskWasEnabled = $true
+
+
+    Disable-ScheduledTask `
+        -TaskName $RebootTaskName `
+        -ErrorAction Stop |
+    Out-Null
+
+
+    Write-Log (
+        'Geplande rollback-reboot taak uitgeschakeld.'
+    )
+}
+
+
+$PreviousRebootFileContent =
+    Get-TextFileValue `
+        -Path $RollbackRebootFile
+
+
+# =====================================================================
+# STATUS
+# =====================================================================
+
+Set-Content `
+    -Path $RollbackStateFile `
+    -Value 'RebootingNow' `
+    -Encoding ASCII
+
+
+Set-Content `
+    -Path $RollbackRebootFile `
+    -Value "MANUAL: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" `
+    -Encoding ASCII
+
+
+Write-Log 'rollback-state.txt = RebootingNow.'
+Write-Log 'Directe reboot wordt over 10 seconden aangevraagd.'
+
+
+# =====================================================================
+# REBOOT
+# =====================================================================
+
+& shutdown.exe `
+    /r `
+    /t 10 `
+    /d p:2:4 `
+    /c "Webstate - directe reboot na bevestigde CBS KB rollback"
+
+
+$ShutdownExitCode = $LASTEXITCODE
+
+
+if ($ShutdownExitCode -ne 0) {
+
+    Write-Log (
+        "FOUT: shutdown.exe retourneerde $ShutdownExitCode."
+    )
+
+
+    Set-Content `
+        -Path $RollbackStateFile `
+        -Value 'RebootScheduled' `
+        -Encoding ASCII
+
+
+    if ($PreviousRebootFileContent) {
+
+        Set-Content `
+            -Path $RollbackRebootFile `
+            -Value $PreviousRebootFileContent `
+            -Encoding ASCII
+    }
+
+
+    if (
+        $RebootTask -and
+        $RebootTaskWasEnabled
+    ) {
+
+        Enable-ScheduledTask `
+            -TaskName $RebootTaskName `
+            -ErrorAction SilentlyContinue |
+        Out-Null
+    }
+
+
+    throw (
+        "Directe reboot kon niet worden gestart. " +
+        "Exitcode=$ShutdownExitCode"
+    )
+}
+
+
+Write-Log 'shutdown.exe heeft de directe reboot geaccepteerd.'
+
+exit 0

@@ -1,0 +1,442 @@
+#Requires -Version 5.1
+
+[CmdletBinding()]
+param (
+    [ValidateSet('Guard','CheckInstalled')]
+    [string]$Mode = 'Guard'
+)
+
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+
+$BaseDir    = 'C:\ProgramData\Webstate'
+$StateDir   = 'C:\ProgramData\Webstate\WindowsUpdateGuard'
+$LogFile    = Join-Path $StateDir 'guard.log'
+$ExitFile   = Join-Path $StateDir 'exitcode.txt'
+$StateFile  = Join-Path $StateDir 'state.txt'
+$TargetFile = Join-Path $StateDir 'targetkb.txt'
+$InstallFile = Join-Path $StateDir 'installed.txt'
+$MessageFile = Join-Path $StateDir 'message.txt'
+$LastRunFile = Join-Path $StateDir 'last-run.txt'
+
+$ModuleUrl = 'http://provisioning.webstate.nl/snom/_D7/PSWindowsUpdate.zip'
+
+New-Item -ItemType Directory -Path $BaseDir -Force | Out-Null
+New-Item -ItemType Directory -Path $StateDir -Force | Out-Null
+
+function Write-GuardLog {
+    param([string]$Message)
+
+    $Line = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - $Message"
+    Add-Content -Path $LogFile -Value $Line -Encoding UTF8
+}
+
+function Get-TargetKB {
+
+    $CV = Get-ItemProperty `
+        'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' `
+        -ErrorAction Stop
+
+    $Build = [int]$CV.CurrentBuildNumber
+
+    switch ($Build) {
+
+        26100 {
+            return 'KB5122871'
+        }
+
+        20348 {
+            return 'KB5122882'
+        }
+
+        17763 {
+            return 'KB5122890'
+        }
+
+        default {
+            return $null
+        }
+    }
+}
+
+function Set-InstalledState {
+    param(
+        [string]$TargetKB
+    )
+
+    $Installed = 0
+
+    if ($TargetKB) {
+
+        $HotFix = Get-HotFix `
+            -Id $TargetKB `
+            -ErrorAction SilentlyContinue
+
+        if ($HotFix) {
+            $Installed = 1
+        }
+    }
+
+    Set-Content `
+        -Path $InstallFile `
+        -Value $Installed `
+        -Encoding ASCII
+
+    return $Installed
+}
+
+function Finish-Guard {
+    param(
+        [int]$Code,
+        [string]$State,
+        [string]$TargetKB,
+        [string]$Message
+    )
+
+    Set-Content `
+        -Path $ExitFile `
+        -Value $Code `
+        -Encoding ASCII
+
+    Set-Content `
+        -Path $StateFile `
+        -Value $State `
+        -Encoding UTF8
+
+    Set-Content `
+        -Path $TargetFile `
+        -Value $TargetKB `
+        -Encoding ASCII
+
+    Set-Content `
+        -Path $MessageFile `
+        -Value $Message `
+        -Encoding UTF8
+
+    Set-Content `
+        -Path $LastRunFile `
+        -Value (Get-Date).ToString('yyyy-MM-dd HH:mm:ss') `
+        -Encoding ASCII
+
+    Write-GuardLog "RESULT=$Code STATE=$State KB=$TargetKB MESSAGE=$Message"
+
+    Write-Output $Code
+
+    # Bewust exit 0:
+    # Zabbix leest onze statuscode uit stdout/bestand.
+    exit 0
+}
+
+function Install-PSWindowsUpdateModule {
+
+    $Existing = Get-Module `
+        -ListAvailable `
+        -Name PSWindowsUpdate |
+        Sort-Object Version -Descending |
+        Select-Object -First 1
+
+    if ($Existing) {
+        Write-GuardLog "PSWindowsUpdate reeds aanwezig: $($Existing.Version)"
+        return $true
+    }
+
+    # --------------------------------------------------------
+    # Eerst Webstate provisioning proberen
+    # --------------------------------------------------------
+
+    Write-GuardLog 'PSWindowsUpdate ontbreekt. Provisioning-download proberen.'
+
+    $ModuleRoot = Join-Path $env:ProgramFiles 'WindowsPowerShell\Modules'
+    $ModulePath = Join-Path $ModuleRoot 'PSWindowsUpdate'
+    $ZipFile    = Join-Path $env:TEMP 'PSWindowsUpdate.zip'
+
+    try {
+
+        Remove-Item `
+            -Path $ZipFile `
+            -Force `
+            -ErrorAction SilentlyContinue
+
+        Invoke-RestMethod `
+            -Uri $ModuleUrl `
+            -OutFile $ZipFile `
+            -ErrorAction Stop
+
+        if (Test-Path $ModulePath) {
+            Remove-Item `
+                -Path $ModulePath `
+                -Recurse `
+                -Force `
+                -ErrorAction Stop
+        }
+
+        Expand-Archive `
+            -Path $ZipFile `
+            -DestinationPath $ModuleRoot `
+            -Force
+
+        Get-ChildItem `
+            -Path $ModulePath `
+            -Recurse `
+            -File `
+            -ErrorAction SilentlyContinue |
+            Unblock-File `
+                -ErrorAction SilentlyContinue
+
+        Remove-Item `
+            -Path $ZipFile `
+            -Force `
+            -ErrorAction SilentlyContinue
+    }
+    catch {
+        Write-GuardLog "Provisioning-installatie mislukt: $($_.Exception.Message)"
+    }
+
+    $Existing = Get-Module `
+        -ListAvailable `
+        -Name PSWindowsUpdate |
+        Sort-Object Version -Descending |
+        Select-Object -First 1
+
+    if ($Existing) {
+        Write-GuardLog "PSWindowsUpdate vanaf provisioning geinstalleerd: $($Existing.Version)"
+        return $true
+    }
+
+    # --------------------------------------------------------
+    # Fallback: PowerShell Gallery
+    # --------------------------------------------------------
+
+    Write-GuardLog 'Provisioning niet gelukt. PSGallery fallback starten.'
+
+    try {
+
+        [Net.ServicePointManager]::SecurityProtocol = `
+            [Net.ServicePointManager]::SecurityProtocol -bor `
+            [Net.SecurityProtocolType]::Tls12
+
+        if (-not (Get-PackageProvider -Name NuGet -ErrorAction SilentlyContinue)) {
+
+            Install-PackageProvider `
+                -Name NuGet `
+                -MinimumVersion 2.8.5.201 `
+                -Force `
+                -Scope AllUsers |
+                Out-Null
+        }
+
+        if (-not (Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue)) {
+            Register-PSRepository -Default
+        }
+
+        Set-PSRepository `
+            -Name PSGallery `
+            -InstallationPolicy Trusted `
+            -ErrorAction SilentlyContinue
+
+        Install-Module `
+            -Name PSWindowsUpdate `
+            -Repository PSGallery `
+            -Scope AllUsers `
+            -Force `
+            -AllowClobber `
+            -Confirm:$false
+    }
+    catch {
+        Write-GuardLog "PSGallery-installatie mislukt: $($_.Exception.Message)"
+    }
+
+    $Existing = Get-Module `
+        -ListAvailable `
+        -Name PSWindowsUpdate |
+        Sort-Object Version -Descending |
+        Select-Object -First 1
+
+    if ($Existing) {
+        Write-GuardLog "PSWindowsUpdate vanaf PSGallery geinstalleerd: $($Existing.Version)"
+        return $true
+    }
+
+    return $false
+}
+
+function Test-KBHidden {
+    param(
+        [Parameter(Mandatory)]
+        [string]$KB
+    )
+
+    $Hidden = Get-WindowsUpdate `
+        -IsHidden `
+        -ErrorAction SilentlyContinue |
+        Where-Object {
+            (
+                "$($_.KB) $($_.KBArticleID) $($_.Title)"
+            ) -match [regex]::Escape($KB)
+        }
+
+    return [bool]$Hidden
+}
+
+# ============================================================
+# TARGET KB
+# ============================================================
+
+$TargetKB = Get-TargetKB
+
+# ============================================================
+# MODE: CHECK INSTALLED
+# ============================================================
+
+if ($Mode -eq 'CheckInstalled') {
+
+    $Installed = Set-InstalledState -TargetKB $TargetKB
+
+    Write-Output $Installed
+    exit 0
+}
+
+# ============================================================
+# MODE: GUARD
+# ============================================================
+
+try {
+
+    $CV = Get-ItemProperty `
+        'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+
+    Write-GuardLog '============================================================'
+    Write-GuardLog 'Windows Update KB Guard gestart'
+    Write-GuardLog "Computer=$env:COMPUTERNAME"
+    Write-GuardLog "Build=$($CV.CurrentBuildNumber)"
+    Write-GuardLog "TargetKB=$TargetKB"
+
+    Set-Content `
+        -Path $TargetFile `
+        -Value $TargetKB `
+        -Encoding ASCII
+
+    # --------------------------------------------------------
+    # Geen KB voor dit OS
+    # --------------------------------------------------------
+
+    if (-not $TargetKB) {
+
+        Set-InstalledState -TargetKB $null | Out-Null
+
+        Finish-Guard `
+            -Code 0 `
+            -State 'NotApplicable' `
+            -TargetKB '' `
+            -Message 'Geen probleem-KB geconfigureerd voor deze Windows Server-versie.'
+    }
+
+    # --------------------------------------------------------
+    # Is hij al geinstalleerd?
+    # --------------------------------------------------------
+
+    $Installed = Set-InstalledState -TargetKB $TargetKB
+
+    if ($Installed -eq 1) {
+
+        Finish-Guard `
+            -Code 30 `
+            -State 'Installed' `
+            -TargetKB $TargetKB `
+            -Message "$TargetKB is reeds geinstalleerd. Eerst uninstall en reboot noodzakelijk."
+    }
+
+    # --------------------------------------------------------
+    # PSWindowsUpdate beschikbaar maken
+    # --------------------------------------------------------
+
+    $ModuleOK = Install-PSWindowsUpdateModule
+
+    if (-not $ModuleOK) {
+
+        Finish-Guard `
+            -Code 20 `
+            -State 'ModuleInstallFailed' `
+            -TargetKB $TargetKB `
+            -Message 'PSWindowsUpdate kon niet worden geinstalleerd.'
+    }
+
+    Import-Module `
+        PSWindowsUpdate `
+        -Force `
+        -ErrorAction Stop
+
+    # --------------------------------------------------------
+    # Staat hij al hidden?
+    # --------------------------------------------------------
+
+    if (Test-KBHidden -KB $TargetKB) {
+
+        Finish-Guard `
+            -Code 0 `
+            -State 'Hidden' `
+            -TargetKB $TargetKB `
+            -Message "$TargetKB staat reeds verborgen."
+    }
+
+    # --------------------------------------------------------
+    # Wordt hij aangeboden?
+    # --------------------------------------------------------
+
+    Write-GuardLog "Windows Update scan voor $TargetKB"
+
+    $Available = Get-WindowsUpdate `
+        -KBArticleID $TargetKB `
+        -ErrorAction SilentlyContinue
+
+    if (-not $Available) {
+
+        Finish-Guard `
+            -Code 0 `
+            -State 'NotOffered' `
+            -TargetKB $TargetKB `
+            -Message "$TargetKB wordt momenteel niet aangeboden. Volgende guard-run controleert opnieuw."
+    }
+
+    # --------------------------------------------------------
+    # KB verbergen
+    # --------------------------------------------------------
+
+    Write-GuardLog "$TargetKB wordt HIDDEN gezet."
+
+    Get-WindowsUpdate `
+        -KBArticleID $TargetKB `
+        -Hide `
+        -Confirm:$false `
+        -ErrorAction Stop |
+        Out-Null
+
+    Start-Sleep -Seconds 2
+
+    # --------------------------------------------------------
+    # Eindcontrole
+    # --------------------------------------------------------
+
+    if (Test-KBHidden -KB $TargetKB) {
+
+        Finish-Guard `
+            -Code 0 `
+            -State 'Hidden' `
+            -TargetKB $TargetKB `
+            -Message "$TargetKB is succesvol verborgen."
+    }
+
+    Finish-Guard `
+        -Code 40 `
+        -State 'HideFailed' `
+        -TargetKB $TargetKB `
+        -Message "$TargetKB kon niet als hidden worden bevestigd."
+}
+catch {
+
+    Finish-Guard `
+        -Code 50 `
+        -State 'Error' `
+        -TargetKB $TargetKB `
+        -Message $_.Exception.Message
+}

@@ -1,0 +1,400 @@
+Import-Module GroupPolicy -ErrorAction Stop
+
+$GpoName = "Windows Update"
+$AUKey   = "HKLM\Software\Policies\Microsoft\Windows\WindowsUpdate\AU"
+$WUKey   = "HKLM\Software\Policies\Microsoft\Windows\WindowsUpdate"
+
+Write-Host ""
+Write-Host "============================================================" -ForegroundColor Cyan
+Write-Host " Windows Update GPO Migration" -ForegroundColor Cyan
+Write-Host "============================================================" -ForegroundColor Cyan
+
+# ------------------------------------------------------------
+# 1. Controleer GPO
+# ------------------------------------------------------------
+
+$Gpo = Get-GPO -Name $GpoName -ErrorAction Stop
+
+Write-Host ""
+Write-Host "GPO    : $($Gpo.DisplayName)"
+Write-Host "Domain : $($Gpo.DomainName)"
+Write-Host "ID     : $($Gpo.Id)"
+
+# ------------------------------------------------------------
+# 2. Backup
+# ------------------------------------------------------------
+
+$BackupRoot = "C:\GPO-Backups"
+$BackupPath = Join-Path $BackupRoot `
+    ("WindowsUpdate-" + (Get-Date -Format "yyyyMMdd-HHmmss"))
+
+New-Item -ItemType Directory -Path $BackupPath -Force | Out-Null
+
+Backup-GPO `
+    -Name $GpoName `
+    -Path $BackupPath `
+    -Comment "Backup before Windows Update baseline migration" `
+    | Out-Null
+
+Write-Host ""
+Write-Host "Backup gemaakt:" -ForegroundColor Green
+Write-Host $BackupPath
+
+# ------------------------------------------------------------
+# 3. MAIN BASELINE
+#
+# Server 2016+:
+# Option 7 = Auto Download, Notify to install, Notify to Restart
+#
+# Server 2012/R2 heeft aparte compatibility GPO nodig:
+# AUOptions = 3
+# ------------------------------------------------------------
+
+Write-Host ""
+Write-Host "[1/7] Configure Automatic Updates..." -ForegroundColor Yellow
+
+Set-GPRegistryValue `
+    -Name $GpoName `
+    -Key $AUKey `
+    -ValueName "AUOptions" `
+    -Type DWord `
+    -Value 7
+
+# Automatic Updates enabled
+Set-GPRegistryValue `
+    -Name $GpoName `
+    -Key $AUKey `
+    -ValueName "NoAutoUpdate" `
+    -Type DWord `
+    -Value 0
+
+# ------------------------------------------------------------
+# 4. Geen immediate/minor auto installs
+# ------------------------------------------------------------
+
+Write-Host "[2/7] Disable automatic minor update installation..." -ForegroundColor Yellow
+
+Set-GPRegistryValue `
+    -Name $GpoName `
+    -Key $AUKey `
+    -ValueName "AutoInstallMinorUpdates" `
+    -Type DWord `
+    -Value 0
+
+# ------------------------------------------------------------
+# 5. Reboot protection
+# ------------------------------------------------------------
+
+Write-Host "[3/7] Configure reboot protection..." -ForegroundColor Yellow
+
+Set-GPRegistryValue `
+    -Name $GpoName `
+    -Key $AUKey `
+    -ValueName "NoAutoRebootWithLoggedOnUsers" `
+    -Type DWord `
+    -Value 1
+
+Set-GPRegistryValue `
+    -Name $GpoName `
+    -Key $AUKey `
+    -ValueName "AlwaysAutoRebootAtScheduledTime" `
+    -Type DWord `
+    -Value 0
+
+# ------------------------------------------------------------
+# 6. Microsoft Update direct - geen WSUS
+# ------------------------------------------------------------
+
+Write-Host "[4/7] Configure direct Microsoft Update access..." -ForegroundColor Yellow
+
+Set-GPRegistryValue `
+    -Name $GpoName `
+    -Key $AUKey `
+    -ValueName "UseWUServer" `
+    -Type DWord `
+    -Value 0
+
+# ------------------------------------------------------------
+# 7. Oude installatieschedule verwijderen
+# ------------------------------------------------------------
+
+Write-Host "[5/7] Remove old scheduled-install settings..." -ForegroundColor Yellow
+
+$RemoveAUValues = @(
+    "ScheduledInstallDay",
+    "ScheduledInstallTime",
+    "ScheduledInstallEveryWeek",
+    "ScheduledInstallFirstWeek",
+    "ScheduledInstallSecondWeek",
+    "ScheduledInstallThirdWeek",
+    "ScheduledInstallFourthWeek",
+    "AllowMUUpdateService"
+)
+
+foreach ($Value in $RemoveAUValues) {
+
+    Remove-GPRegistryValue `
+        -Name $GpoName `
+        -Key $AUKey `
+        -ValueName $Value `
+        -ErrorAction SilentlyContinue
+}
+
+# ------------------------------------------------------------
+# 8. Oude WSUS configuratie verwijderen
+# ------------------------------------------------------------
+
+Write-Host "[6/7] Remove old WSUS settings..." -ForegroundColor Yellow
+
+$RemoveWUValues = @(
+    "WUServer",
+    "WUStatusServer",
+    "UpdateServiceUrlAlternate"
+)
+
+foreach ($Value in $RemoveWUValues) {
+
+    Remove-GPRegistryValue `
+        -Name $GpoName `
+        -Key $WUKey `
+        -ValueName $Value `
+        -ErrorAction SilentlyContinue
+}
+
+# ------------------------------------------------------------
+# 9. Deadline policies verwijderen
+# ------------------------------------------------------------
+
+Write-Host "[7/7] Remove update/reboot deadline overrides..." -ForegroundColor Yellow
+
+$RemoveDeadlineValues = @(
+    "SetComplianceDeadline",
+    "ConfigureDeadlineForQualityUpdates",
+    "ConfigureDeadlineForFeatureUpdates",
+    "ConfigureDeadlineGracePeriod",
+    "ConfigureDeadlineNoAutoReboot"
+)
+
+foreach ($Value in $RemoveDeadlineValues) {
+
+    Remove-GPRegistryValue `
+        -Name $GpoName `
+        -Key $WUKey `
+        -ValueName $Value `
+        -ErrorAction SilentlyContinue
+}
+
+# ------------------------------------------------------------
+# 10. GPO wijziging gereed
+# ------------------------------------------------------------
+
+Write-Host ""
+Write-Host "GPO '$GpoName' succesvol aangepast." -ForegroundColor Green
+
+# ------------------------------------------------------------
+# 11. GPUPDATE /FORCE
+# ------------------------------------------------------------
+
+Write-Host ""
+Write-Host "============================================================" -ForegroundColor Cyan
+Write-Host " Applying Group Policy locally" -ForegroundColor Cyan
+Write-Host "============================================================" -ForegroundColor Cyan
+Write-Host ""
+
+Write-Host "Running gpupdate /force..." -ForegroundColor Yellow
+
+$GPProcess = Start-Process `
+    -FilePath "gpupdate.exe" `
+    -ArgumentList "/force" `
+    -Wait `
+    -PassThru `
+    -NoNewWindow
+
+if ($GPProcess.ExitCode -eq 0) {
+    Write-Host "gpupdate /force completed successfully." -ForegroundColor Green
+}
+else {
+    Write-Host "gpupdate returned exit code $($GPProcess.ExitCode)." -ForegroundColor Red
+}
+
+# ------------------------------------------------------------
+# 12. Restart Windows Update service
+# ------------------------------------------------------------
+
+Write-Host ""
+Write-Host "Restarting Windows Update service..." -ForegroundColor Yellow
+
+try {
+
+    Restart-Service `
+        -Name wuauserv `
+        -Force `
+        -ErrorAction Stop
+
+    Start-Sleep -Seconds 3
+
+    $WUService = Get-Service wuauserv
+
+    Write-Host "wuauserv state: $($WUService.Status)" -ForegroundColor Green
+}
+catch {
+
+    Write-Host "Could not restart wuauserv:" -ForegroundColor Red
+    Write-Host $_.Exception.Message
+}
+
+# ------------------------------------------------------------
+# 13. LOCAL EFFECTIVE BASELINE CHECK
+# ------------------------------------------------------------
+
+Write-Host ""
+Write-Host "============================================================" -ForegroundColor Cyan
+Write-Host " Local Windows Update Baseline Check" -ForegroundColor Cyan
+Write-Host "============================================================" -ForegroundColor Cyan
+Write-Host ""
+
+$LocalAUPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU"
+$LocalWUPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate"
+
+$AU = Get-ItemProperty `
+    -Path $LocalAUPath `
+    -ErrorAction SilentlyContinue
+
+$WU = Get-ItemProperty `
+    -Path $LocalWUPath `
+    -ErrorAction SilentlyContinue
+
+$OS = Get-CimInstance Win32_OperatingSystem
+
+# ------------------------------------------------------------
+# Detect OS generation
+# ------------------------------------------------------------
+
+$Build = [int]$OS.BuildNumber
+
+if ($Build -lt 9600) {
+    $ExpectedAUOptions = 3
+    $BaselineName = "Server 2012 compatibility baseline"
+}
+elseif ($Build -lt 14393) {
+    $ExpectedAUOptions = 3
+    $BaselineName = "Server 2012 R2 compatibility baseline"
+}
+else {
+    $ExpectedAUOptions = 7
+    $BaselineName = "Server 2016+ baseline"
+}
+
+# ------------------------------------------------------------
+# Checks
+# ------------------------------------------------------------
+
+$OK_AUOptions =
+    ($AU.AUOptions -eq $ExpectedAUOptions)
+
+$OK_NoAutoUpdate =
+    ($AU.NoAutoUpdate -eq 0)
+
+$OK_UseWUServer =
+    (($null -eq $AU.UseWUServer) -or ($AU.UseWUServer -eq 0))
+
+$OK_Minor =
+    (($null -eq $AU.AutoInstallMinorUpdates) -or
+     ($AU.AutoInstallMinorUpdates -eq 0))
+
+$OK_NoAutoReboot =
+    ($AU.NoAutoRebootWithLoggedOnUsers -eq 1)
+
+$OK_ForcedReboot =
+    (($null -eq $AU.AlwaysAutoRebootAtScheduledTime) -or
+     ($AU.AlwaysAutoRebootAtScheduledTime -eq 0))
+
+$OK_Schedule =
+    (($null -eq $AU.ScheduledInstallDay) -and
+     ($null -eq $AU.ScheduledInstallTime))
+
+$OK_WSUS =
+    (($null -eq $WU.WUServer) -and
+     ($null -eq $WU.WUStatusServer))
+
+$OK_MUOverride =
+    ($null -eq $AU.AllowMUUpdateService)
+
+$OK_Deadline =
+    (($null -eq $WU.SetComplianceDeadline) -or
+     ($WU.SetComplianceDeadline -eq 0))
+
+# ------------------------------------------------------------
+# Summary
+# ------------------------------------------------------------
+
+Write-Host "OS                         : $($OS.Caption)"
+Write-Host "Version                    : $($OS.Version)"
+Write-Host "Build                      : $Build"
+Write-Host "Expected baseline          : $BaselineName"
+Write-Host ""
+
+Write-Host "AUOptions                  : $($AU.AUOptions) | Expected: $ExpectedAUOptions | OK: $OK_AUOptions"
+
+Write-Host "NoAutoUpdate               : $(if($null -eq $AU.NoAutoUpdate){'ABSENT'}else{$AU.NoAutoUpdate}) | Expected: 0 | OK: $OK_NoAutoUpdate"
+
+Write-Host "UseWUServer                : $(if($null -eq $AU.UseWUServer){'ABSENT'}else{$AU.UseWUServer}) | Expected: 0/ABSENT | OK: $OK_UseWUServer"
+
+Write-Host "AutoInstallMinorUpdates    : $(if($null -eq $AU.AutoInstallMinorUpdates){'ABSENT'}else{$AU.AutoInstallMinorUpdates}) | Expected: 0/ABSENT | OK: $OK_Minor"
+
+Write-Host "NoAutoRebootLoggedOnUsers  : $(if($null -eq $AU.NoAutoRebootWithLoggedOnUsers){'ABSENT'}else{$AU.NoAutoRebootWithLoggedOnUsers}) | Expected: 1 | OK: $OK_NoAutoReboot"
+
+Write-Host "AlwaysAutoReboot           : $(if($null -eq $AU.AlwaysAutoRebootAtScheduledTime){'ABSENT'}else{$AU.AlwaysAutoRebootAtScheduledTime}) | Expected: 0/ABSENT | OK: $OK_ForcedReboot"
+
+Write-Host "ScheduledInstallDay        : $(if($null -eq $AU.ScheduledInstallDay){'ABSENT'}else{$AU.ScheduledInstallDay})"
+
+Write-Host "ScheduledInstallTime       : $(if($null -eq $AU.ScheduledInstallTime){'ABSENT'}else{$AU.ScheduledInstallTime}) | Expected both ABSENT | OK: $OK_Schedule"
+
+Write-Host "WUServer                   : $(if($null -eq $WU.WUServer){'ABSENT'}else{$WU.WUServer})"
+
+Write-Host "WUStatusServer             : $(if($null -eq $WU.WUStatusServer){'ABSENT'}else{$WU.WUStatusServer}) | Expected both ABSENT | OK: $OK_WSUS"
+
+Write-Host "AllowMUUpdateService       : $(if($null -eq $AU.AllowMUUpdateService){'ABSENT'}else{$AU.AllowMUUpdateService}) | Expected: ABSENT | OK: $OK_MUOverride"
+
+Write-Host "ComplianceDeadline         : $(if($null -eq $WU.SetComplianceDeadline){'ABSENT'}else{$WU.SetComplianceDeadline}) | Expected: 0/ABSENT | OK: $OK_Deadline"
+
+# ------------------------------------------------------------
+# Final result
+# ------------------------------------------------------------
+
+$ConfigurationOK =
+    $OK_AUOptions -and
+    $OK_NoAutoUpdate -and
+    $OK_UseWUServer -and
+    $OK_Minor -and
+    $OK_NoAutoReboot -and
+    $OK_ForcedReboot -and
+    $OK_Schedule -and
+    $OK_WSUS -and
+    $OK_MUOverride -and
+    $OK_Deadline
+
+Write-Host ""
+Write-Host "------------------------------------------------------------"
+
+if ($ConfigurationOK) {
+
+    Write-Host "RESULT: CONFIGURATION OK" -ForegroundColor Green
+}
+else {
+
+    Write-Host "RESULT: CONFIGURATION NOT OK" -ForegroundColor Red
+}
+
+Write-Host "------------------------------------------------------------"
+
+Write-Host ""
+Write-Host "Backup location:"
+Write-Host $BackupPath
+
+Write-Host ""
+Write-Host "NOTE:" -ForegroundColor Yellow
+Write-Host "This baseline check validates THIS computer."
+Write-Host "When this script runs on a DC, it validates the DC itself."
+Write-Host "Member servers should still be checked after their own GP refresh."
+Write-Host ""
